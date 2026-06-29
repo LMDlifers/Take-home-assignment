@@ -5,13 +5,16 @@ Callers should receive plain Python data structures, not raw cursor objects.
 """
 
 import os
+from typing import Any
 
 import psycopg
+from psycopg.rows import dict_row
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/scheduling_db",
 )
+FORBIDDEN_SQL = ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE")
 
 
 def check_db() -> bool:
@@ -23,3 +26,79 @@ def check_db() -> bool:
                 return cur.fetchone() == (1,)
     except psycopg.Error:
         return False
+
+
+def fetch_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    """Run a read-only query and return rows as dictionaries."""
+    if not is_safe_select(sql):
+        raise ValueError("Only safe SELECT queries are allowed")
+
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
+
+def is_safe_select(sql: str) -> bool:
+    """Return whether SQL is a single read-only SELECT statement."""
+    cleaned = sql.strip()
+    upper = cleaned.upper()
+    if not upper.startswith("SELECT"):
+        return False
+    if ";" in cleaned.rstrip(";"):
+        return False
+    return not any(word in upper.split() for word in FORBIDDEN_SQL)
+
+
+def get_machine_loads() -> list[dict[str, Any]]:
+    """Return all machine load rows from the seeded view."""
+    return fetch_all(
+        """
+        SELECT machine_id, machine_name, machine_type, capacity_hours_day,
+               available_hours_today, current_status, queued_hours, load_pct
+        FROM v_machine_load
+        ORDER BY load_pct DESC NULLS LAST, machine_id ASC
+        """
+    )
+
+
+def get_at_risk_orders() -> list[dict[str, Any]]:
+    """Return at-risk work orders from the seeded view."""
+    return fetch_all(
+        """
+        SELECT wo_id, product_code, quantity, required_machine,
+               processing_time_hr, priority, due_date, status,
+               available_hours_today, machine_status, risk_reason
+        FROM v_at_risk_orders
+        ORDER BY priority ASC, due_date ASC, wo_id ASC
+        """
+    )
+
+
+def get_machine(machine_id: str) -> dict[str, Any] | None:
+    """Return one machine row, or None when the machine does not exist."""
+    rows = fetch_all(
+        """
+        SELECT machine_id, machine_name, capacity_hours_day,
+               available_hours_today, current_status
+        FROM machines
+        WHERE machine_id = %s
+        """,
+        (machine_id,),
+    )
+    return rows[0] if rows else None
+
+
+def get_active_orders_for_machine(machine_id: str) -> list[dict[str, Any]]:
+    """Return pending or in-progress orders assigned to one machine."""
+    return fetch_all(
+        """
+        SELECT wo_id, product_code, required_machine, processing_time_hr,
+               priority, due_date, status
+        FROM work_orders
+        WHERE required_machine = %s
+          AND status IN ('pending', 'in_progress')
+        ORDER BY priority ASC, due_date ASC, wo_id ASC
+        """,
+        (machine_id,),
+    )

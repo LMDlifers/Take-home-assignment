@@ -4,7 +4,7 @@ from app import main
 
 
 def test_health_ok(monkeypatch) -> None:
-    monkeypatch.setattr(main, "check_db", lambda: True)
+    monkeypatch.setattr(main.db, "check_db", lambda: True)
 
     response = TestClient(main.app).get("/api/v1/health")
 
@@ -13,7 +13,7 @@ def test_health_ok(monkeypatch) -> None:
 
 
 def test_health_degraded(monkeypatch) -> None:
-    monkeypatch.setattr(main, "check_db", lambda: False)
+    monkeypatch.setattr(main.db, "check_db", lambda: False)
 
     response = TestClient(main.app).get("/api/v1/health")
 
