@@ -121,45 +121,71 @@ def generate_sql(question: str) -> str:
     return sql.rstrip(";")
 
 
-@lru_cache(maxsize=1)
-def prompt_config() -> dict[str, Any]:
-    """Load prompt and schema context for the planning copilot."""
-    path = Path(__file__).resolve().parents[1] / "prompts" / "planning_copilot.yaml"
+@lru_cache(maxsize=None)
+def load_prompt(name: str) -> dict[str, Any]:
+    """Load one YAML prompt template by filename."""
+    path = Path(__file__).resolve().parents[1] / "prompts" / name
     with path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
 
+def schema_context() -> dict[str, Any]:
+    """Return schema meanings, known values, and business rules."""
+    return load_prompt("schema_context.yaml")
+
+
+def sql_generation_config() -> dict[str, Any]:
+    """Return Qwen SQL generation role and rules."""
+    return load_prompt("sql_generation.yaml")
+
+
+def explanation_config() -> dict[str, Any]:
+    """Return Qwen explanation role, rules, and fallback wording."""
+    return load_prompt("explanation.yaml")
+
+
 def sql_prompt() -> str:
     """Build the SQL generation prompt from YAML context."""
-    config = prompt_config()
-    return f"""{config["agent"]["role"]}
+    sql_config = sql_generation_config()
+    context = schema_context()
+    return f"""{sql_config["agent"]["role"]}
 
 Purpose:
-{config["agent"]["model_purpose"]}
+{sql_config["agent"]["model_purpose"]}
 
 Schema context:
-{yaml.safe_dump(config["schema"], sort_keys=False)}
+{yaml.safe_dump(context["schema"], sort_keys=False)}
+
+Known values:
+{yaml.safe_dump(context["known_values"], sort_keys=False)}
 
 Business rules:
-{yaml.safe_dump(config["business_rules"], sort_keys=False)}
+{yaml.safe_dump(context["business_rules"], sort_keys=False)}
 
 Rules:
-{yaml.safe_dump(config["sql_generation"]["rules"], sort_keys=False)}
+{yaml.safe_dump(sql_config["rules"], sort_keys=False)}
 """
 
 
 def explain_result(question: str, data: list[dict[str, Any]]) -> str:
     """Ask Qwen to explain returned rows, with a deterministic fallback."""
+    config = explanation_config()
     if not data:
-        return "I did not find matching scheduling records for that question."
+        return config["fallback"]["empty_result"]
 
     payload = json.dumps(data, default=str)
-    prompt = (
-        f"Question asked: {question}\n"
-        f"Data returned: {payload}\n"
-        "Write a clear 3 sentence planning answer. Mention specific work order or machine IDs. "
-        "Do not mention SQL, JSON, or databases. Do not invent facts."
-    )
+    rules = yaml.safe_dump(config["rules"], sort_keys=False)
+    prompt = f"""{config["agent"]["role"]}
+
+Question asked:
+{question}
+
+Data returned:
+{payload}
+
+Rules:
+{rules}
+"""
     try:
         return ollama_chat([{"role": "user", "content": prompt}])
     except httpx.HTTPError:

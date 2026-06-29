@@ -1,14 +1,10 @@
-agent:
-  role: "PostgreSQL assistant for a manufacturing shop floor scheduling system"
-  model_purpose: "Generate safe read-only SQL and explain retrieved scheduling data."
-
-sql_generation:
-  rules:
-    - "Return one PostgreSQL SELECT query only."
-    - "Do not use markdown."
-    - "Do not generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE."
-    - "Prefer provided views when they answer the question."
-    - "Use CURRENT_DATE for relative date questions like today, tomorrow, or this week."
+metadata:
+  purpose: "Schema and business context for Qwen SQL generation."
+  sources:
+    - "GenAI_Agentic_Test.pdf section 3.1 for table purposes and views."
+    - "GenAI_Agentic_Test.pdf section 4.5 for business rules."
+    - "Data/seed.sql for constraints, inserted values, and comments."
+  note: "Meanings are derived from the assignment and seed data; not every sentence is a verbatim quote."
 
 schema:
   tables:
@@ -85,6 +81,29 @@ schema:
       columns:
         days_remaining: "due_date minus CURRENT_DATE."
 
+known_values:
+  machines:
+    machine_id: ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"]
+    current_status: ["available", "partial", "unavailable"]
+    machine_type: ["CNC Mill", "Press", "Laser", "Mill", "Welding", "Grinder"]
+    location: ["Bay A", "Bay B", "Bay C", "Bay D"]
+
+  work_orders:
+    status: ["pending", "in_progress", "completed", "delayed", "on_hold"]
+    priority:
+      "1": "Critical"
+      "2": "High"
+      "3": "Medium"
+      "4": "Low"
+      "5": "Backlog"
+    product_code: ["PART-A", "PART-B", "PART-C", "PART-D", "PART-E", "PART-F", "PART-G", "PART-H", "PART-I", "PART-J"]
+
+  downtime_schedule:
+    downtime_type: ["planned", "unplanned", "calibration"]
+
+  products:
+    product_family: ["Drive Train", "Engine", "Fluid Systems", "Automation", "Frame"]
+
 business_rules:
   load_status:
     - "Overloaded means load_pct > 100."
@@ -94,3 +113,8 @@ business_rules:
     - "status = delayed means already delayed."
     - "pending or in_progress with due_date <= CURRENT_DATE should be treated as at risk."
     - "pending order on an unavailable machine is blocked."
+
+do_not_embed_live_records:
+  - "Do not list every work order in prompt context."
+  - "Do not hardcode due dates, quantities, notes, started_at, or completed_at in YAML."
+  - "Query live operational records from PostgreSQL instead."

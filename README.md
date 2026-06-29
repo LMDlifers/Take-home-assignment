@@ -45,7 +45,9 @@ Take-home-assignment/
       logic.py
       schemas.py
     prompts/
-      planning_copilot.yaml
+      schema_context.yaml
+      sql_generation.yaml
+      explanation.yaml
     tests/
       test_health.py
 ```
@@ -138,17 +140,28 @@ Then test `/ask`:
 curl -X POST http://localhost:8000/api/v1/ask -H "Content-Type: application/json" -d "{\"question\":\"Which work orders are delayed?\"}"
 ```
 
-## Prompt And Schema Context
+## Prompt Templates
 
-Prompt and schema context live in:
+Prompt templates live in:
 
 ```text
-Backend/prompts/planning_copilot.yaml
+Backend/prompts/
 ```
 
-The YAML gives Qwen table purposes, column meanings, useful views, and business
-rules. It is used only to guide SQL generation and explanations; SQL execution
-is still guarded by Python safety checks.
+- `schema_context.yaml` contains table meanings, known values, views, and business rules.
+- `sql_generation.yaml` contains Qwen SQL-generation role and safety instructions.
+- `explanation.yaml` contains Qwen explanation style and fallback wording.
+
+The YAML files guide Qwen only. SQL execution safety is still enforced in Python
+by `db.is_safe_select()`.
+
+Blueprint configuration notes:
+
+- Prompt context node: loads `schema_context.yaml`; context only, no SQL enforcement.
+- SQL generation node: loads `sql_generation.yaml`; Qwen generates candidate `SELECT` SQL for the `run_sql` path only.
+- Explanation node: loads `explanation.yaml`; Qwen explains retrieved rows, with fallback wording if needed.
+- SQL safety node: Python rejects non-SELECT SQL, destructive SQL, and multiple statements before execution.
+- Known values: enum/category-like values live in YAML; live operational records stay in PostgreSQL.
 
 ## Local Tests
 

@@ -35,16 +35,20 @@ def test_sql_safety_rejects_multiple_statements() -> None:
     assert db.is_safe_select("SELECT * FROM work_orders; DROP TABLE work_orders") is False
 
 
-def test_prompt_config_loads_yaml() -> None:
-    config = agent.prompt_config()
+def test_prompt_files_load() -> None:
+    assert agent.schema_context()["schema"]["views"]["v_machine_load"]["purpose"]
+    assert agent.sql_generation_config()["rules"]
+    assert agent.explanation_config()["rules"]
 
-    assert config["schema"]["views"]["v_machine_load"]["purpose"]
 
-
-def test_sql_prompt_includes_schema_meanings() -> None:
+def test_sql_prompt_includes_known_values() -> None:
     prompt = agent.sql_prompt()
 
     assert "v_machine_load" in prompt
     assert "v_at_risk_orders" in prompt
-    assert "priority" in prompt
+    assert "M1" in prompt
+    assert "available" in prompt
+    assert "partial" in prompt
+    assert "unavailable" in prompt
+    assert "Critical" in prompt
     assert "load_pct > 100" in prompt
