@@ -1,0 +1,54 @@
+# Build the API container.
+# Start PostgreSQL.
+# Load seed.sql.
+# Start Ollama.
+# Start FastAPI.
+# Connect everything on the same Docker network.
+
+services:
+  db:
+    image: postgres:16
+    container_name: scheduling_db
+    environment:
+      POSTGRES_DB: scheduling_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./Data/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d scheduling_db" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama
+    container_name: scheduling_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  api:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    container_name: scheduling_api
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/scheduling_db
+      OLLAMA_BASE_URL: http://ollama:11434
+      LLM_MODEL: llama3.2
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+volumes:
+  pg_data:
+  ollama_data:
