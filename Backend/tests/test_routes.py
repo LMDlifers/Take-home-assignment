@@ -88,3 +88,28 @@ def test_simulate_downtime_returns_affected_orders(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["affected_orders"][0]["wo_id"] == "WO-1008"
+
+
+def test_ask_route_returns_response_shape(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "answer_question",
+        lambda question: {
+            "question": question,
+            "tool_used": "check_load",
+            "sql_used": "SELECT machine_id FROM v_machine_load",
+            "data": [{"machine_id": "M3"}],
+            "answer": "M3 is overloaded.",
+            "explanation": "M3 is overloaded.",
+            "confidence": 0.75,
+            "follow_ups": ["Show high-priority orders due this week."],
+        },
+    )
+
+    response = TestClient(main.app).post(
+        "/api/v1/ask",
+        json={"question": "Which machines are overloaded?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tool_used"] == "check_load"

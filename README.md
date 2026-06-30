@@ -2,9 +2,10 @@
 
 Backend-only FastAPI project for the A*Star take-home assignment.
 
-Current status: deterministic backend endpoints and the first GenAI `/ask`
-endpoint are implemented. The app can be containerised with PostgreSQL and
-Ollama, query seeded scheduling data, and use Qwen to generate read-only SQL.
+Current status: deterministic backend endpoints and the `/api/v1/ask` tool
+router are implemented. The app can be containerised with PostgreSQL and
+Ollama, query seeded scheduling data, run deterministic scheduling tools, and
+use Qwen to generate read-only SQL for open-ended SQL questions.
 
 ## What Exists So Far
 
@@ -24,9 +25,19 @@ Ollama, query seeded scheduling data, and use Qwen to generate read-only SQL.
   - `POST /api/v1/ask`
 - Basic health tests in `Backend/tests/`
 
-`/api/v1/ask` uses Ollama with `qwen2.5:3b` to generate read-only SQL and
-explain returned data. Recommendation logic and audit logging are not
-implemented yet.
+`/api/v1/ask` routes questions to simple tools:
+
+- `run_sql` - Qwen generates one safe PostgreSQL `SELECT` query.
+- `check_load` - deterministic query against `v_machine_load`.
+- `get_priority` - deterministic query against `v_priority_queue`.
+- `simulate_downtime` - deterministic Python simulation after reading machine/order data.
+- `recommend` - deterministic recommendations from load and risk data.
+- `refuse` - out-of-scope questions.
+
+Qwen is used for SQL generation only in the `run_sql` path. Other tools use
+deterministic code first, then Qwen may explain the returned data. If Qwen is
+unavailable during explanation, the API returns a simple fallback summary.
+Each `/api/v1/ask` request writes a best-effort audit row to `agent_action_log`.
 
 ## Project Structure
 
@@ -49,7 +60,12 @@ Take-home-assignment/
       sql_generation.yaml
       explanation.yaml
     tests/
+      conftest.py
       test_health.py
+      test_logic.py
+      test_routes.py
+      test_agent.py
+      test_db.py
 ```
 
 ## Run With Docker
@@ -116,6 +132,13 @@ Downtime simulation:
 curl -X POST http://localhost:8000/api/v1/simulate/downtime -H "Content-Type: application/json" -d "{\"machine_id\":\"M2\",\"downtime_hours\":4}"
 ```
 
+In PowerShell, `curl` is often an alias for `Invoke-WebRequest`. This version
+avoids the header parsing issue:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/simulate/downtime" -ContentType "application/json" -Body '{"machine_id":"M2","downtime_hours":4}'
+```
+
 ## Database Seed Check
 
 After the containers are running:
@@ -138,6 +161,43 @@ Then test `/ask`:
 
 ```powershell
 curl -X POST http://localhost:8000/api/v1/ask -H "Content-Type: application/json" -d "{\"question\":\"Which work orders are delayed?\"}"
+```
+
+PowerShell-safe version:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/ask" -ContentType "application/json" -Body '{"question":"Which machines are overloaded?"}'
+```
+
+Useful assessment questions:
+
+```text
+Which work orders are delayed?
+Which machines are overloaded?
+Why is WO-1003 at risk?
+What happens if M2 is down for 4 extra hours?
+Show high-priority orders due this week.
+Recommend actions to reduce delays.
+```
+
+## Audit Logging
+
+`/api/v1/ask` writes one audit row after each response is built. The log records:
+
+- `session_id`
+- `action_type`
+- `input_question`
+- `sql_generated`
+- `result_summary`
+- `confidence`
+
+Logging is best-effort. If the audit insert fails, the API still returns the
+normal response.
+
+Inspect recent logs:
+
+```powershell
+docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT action_type, input_question, sql_generated, result_summary, confidence, created_at FROM agent_action_log ORDER BY created_at DESC LIMIT 5;"
 ```
 
 ## Prompt Templates
@@ -169,4 +229,10 @@ After installing dependencies:
 
 ```powershell
 python -m pytest Backend\tests
+```
+
+Inside the API container after rebuilding:
+
+```powershell
+docker exec -it scheduling_api pytest tests
 ```

@@ -8,14 +8,17 @@ and logs each action for auditability.
 import json
 import os
 import re
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import httpx
+import psycopg
 import yaml
 
 from app import db
+from app import logic
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
@@ -41,32 +44,36 @@ SCHEDULING_TERMS = {
 
 def answer_question(question: str) -> dict[str, Any]:
     """Answer one natural-language planning question."""
+    session_id = str(uuid.uuid4())
+
     if not is_planning_question(question):
-        return {
-            "question": question,
-            "tool_used": "refuse",
-            "sql_used": None,
-            "data": [],
-            "answer": "I can only answer scheduling, machine, or work-order questions.",
-            "explanation": "Ask about work orders, machine load, priority, delays, or downtime.",
-            "confidence": 0.8,
-            "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
-    }
+        response = refuse_response(question)
+        safe_log_action(session_id, response)
+        return response
 
     tool = route_tool(question)
+    if tool == "check_load":
+        response = check_load_tool(question)
+    elif tool == "get_priority":
+        response = get_priority_tool(question)
+    elif tool == "simulate_downtime":
+        response = simulate_downtime_tool(question)
+    elif tool == "recommend":
+        response = recommend_tool(question)
+    else:
+        response = run_sql_tool(question, tool)
+
+    safe_log_action(session_id, response)
+    return response
+
+
+def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
+    """Generate a safe SELECT query, execute it, and explain the result."""
     try:
         sql = generate_sql(question)
     except httpx.HTTPError:
-        return {
-            "question": question,
-            "tool_used": tool,
-            "sql_used": None,
-            "data": [],
-            "answer": "The local LLM is unavailable, so I could not generate SQL for that question.",
-            "explanation": "Check that Ollama is running and that qwen2.5:3b has been pulled.",
-            "confidence": 0.1,
-            "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
-        }
+        return llm_unavailable_response(question, tool)
+
     if not db.is_safe_select(sql):
         return {
             "question": question,
@@ -80,6 +87,81 @@ def answer_question(question: str) -> dict[str, Any]:
         }
 
     data = db.fetch_all(sql)
+    return answer_from_data(question, tool, sql, data)
+
+
+def check_load_tool(question: str) -> dict[str, Any]:
+    """Answer load questions with the deterministic machine-load view."""
+    data = logic.add_load_status(db.get_machine_loads())
+    return answer_from_data(question, "check_load", db.MACHINE_LOAD_SQL.strip(), data)
+
+
+def get_priority_tool(question: str) -> dict[str, Any]:
+    """Answer priority and due-soon questions with the priority view."""
+    data = db.get_priority_queue()
+    return answer_from_data(question, "get_priority", db.PRIORITY_QUEUE_SQL.strip(), data)
+
+
+def simulate_downtime_tool(question: str) -> dict[str, Any]:
+    """Parse one machine and downtime duration, then run deterministic simulation."""
+    machine_match = re.search(r"\bM\d+\b", question, flags=re.IGNORECASE)
+    hours_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:extra\s+|additional\s+|more\s+)?(?:hours?|hrs?|hr|h)\b",
+        question.lower(),
+    )
+    if machine_match is None or hours_match is None:
+        return {
+            "question": question,
+            "tool_used": "simulate_downtime",
+            "sql_used": None,
+            "data": [],
+            "answer": "Please include a machine ID and downtime hours, for example: M2 down for 4 hours.",
+            "explanation": "Downtime simulation needs one machine and one duration.",
+            "confidence": 0.4,
+            "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
+        }
+
+    machine_id = machine_match.group(0).upper()
+    downtime_hours = float(hours_match.group(1))
+    machine = db.get_machine(machine_id)
+    if machine is None:
+        return {
+            "question": question,
+            "tool_used": "simulate_downtime",
+            "sql_used": None,
+            "data": [],
+            "answer": f"I could not find machine {machine_id}.",
+            "explanation": "Use a machine ID from the seeded machine list, such as M1 or M2.",
+            "confidence": 0.4,
+            "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
+        }
+
+    orders = db.get_active_orders_for_machine(machine_id)
+    data = [logic.simulate_downtime(machine, orders, downtime_hours)]
+    return answer_from_data(question, "simulate_downtime", None, data, confidence=0.8)
+
+
+def recommend_tool(question: str) -> dict[str, Any]:
+    """Return deterministic planner actions from current risk and load data."""
+    loads = logic.add_load_status(db.get_machine_loads())
+    risks = db.get_at_risk_orders()
+    overloaded_ids = [row["machine_id"] for row in loads if row["load_status"] == "overloaded"]
+    active_by_machine = {
+        machine_id: db.get_active_orders_for_machine(machine_id)
+        for machine_id in overloaded_ids
+    }
+    data = logic.recommend_actions(loads, risks, active_by_machine)
+    return answer_from_data(question, "recommend", None, data, confidence=0.8)
+
+
+def answer_from_data(
+    question: str,
+    tool: str,
+    sql: str | None,
+    data: list[dict[str, Any]],
+    confidence: float = 0.75,
+) -> dict[str, Any]:
+    """Build the common /ask response from retrieved or computed data."""
     explanation = explain_result(question, data)
     return {
         "question": question,
@@ -88,20 +170,111 @@ def answer_question(question: str) -> dict[str, Any]:
         "data": data,
         "answer": explanation,
         "explanation": explanation,
-        "confidence": 0.75,
+        "confidence": confidence,
         "follow_ups": ["Which machines are causing the most delays?", "Show high-priority orders due this week."],
     }
+
+
+def refuse_response(question: str) -> dict[str, Any]:
+    """Return the standard out-of-scope refusal."""
+    return {
+        "question": question,
+        "tool_used": "refuse",
+        "sql_used": None,
+        "data": [],
+        "answer": "I can only answer scheduling, machine, or work-order questions.",
+        "explanation": "Ask about work orders, machine load, priority, delays, or downtime.",
+        "confidence": 0.8,
+        "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
+    }
+
+
+def llm_unavailable_response(question: str, tool: str) -> dict[str, Any]:
+    """Return the standard response when Qwen SQL generation is unavailable."""
+    return {
+        "question": question,
+        "tool_used": tool,
+        "sql_used": None,
+        "data": [],
+        "answer": "The local LLM is unavailable, so I could not generate SQL for that question.",
+        "explanation": "Check that Ollama is running and that qwen2.5:3b has been pulled.",
+        "confidence": 0.1,
+        "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
+    }
+
+
+def safe_log_action(session_id: str, response: dict[str, Any]) -> None:
+    """Best-effort audit logging; never break the API response."""
+    try:
+        db.log_agent_action(
+            session_id=session_id,
+            action_type=audit_action_type(response),
+            input_question=response["question"],
+            sql_generated=response["sql_used"],
+            result_summary=summarize_result(response["data"]),
+            confidence=response["confidence"],
+        )
+    except psycopg.Error:
+        return
+
+
+def audit_action_type(response: dict[str, Any]) -> str:
+    """Map visible tools to assignment audit action types."""
+    tool = response["tool_used"]
+    if tool == "simulate_downtime":
+        return "simulation"
+    if tool == "recommend":
+        return "recommendation"
+    if tool == "refuse" or (not response["data"] and response["confidence"] < 0.5):
+        return "clarification"
+    return "query_generated"
+
+
+def summarize_result(data: list[dict[str, Any]]) -> str:
+    """Create a short audit summary from returned rows."""
+    if not data:
+        return "No records returned."
+
+    actions = [str(row["action"]) for row in data if row.get("action")]
+    if actions:
+        return f"Generated {len(data)} recommendations: {'; '.join(actions[:3])}."
+
+    work_orders = [str(row["wo_id"]) for row in data if row.get("wo_id")]
+    if work_orders:
+        return f"Found {len(data)} work orders: {', '.join(work_orders[:5])}."
+
+    affected = []
+    for row in data:
+        affected.extend(
+            str(order["wo_id"])
+            for order in row.get("affected_orders", [])
+            if order.get("wo_id")
+        )
+    if affected:
+        return f"Simulation affected {len(affected)} work orders: {', '.join(affected[:5])}."
+
+    machines = [str(row["machine_id"]) for row in data if row.get("machine_id")]
+    if machines:
+        return f"Found {len(data)} machines: {', '.join(machines[:5])}."
+
+    return f"Found {len(data)} records."
 
 
 def is_planning_question(question: str) -> bool:
     """Return whether the question is about the scheduling domain."""
     q = question.lower()
-    return any(term in q for term in SCHEDULING_TERMS)
+    return any(term in q for term in SCHEDULING_TERMS) or bool(
+        re.search(r"\b(?:wo-\d+|m\d+)\b", q)
+    )
 
 
 def route_tool(question: str) -> str:
     """Pick the visible tool name for the /ask response."""
     q = question.lower()
+    if "recommend" in q or "action" in q or "reduce delay" in q:
+        return "recommend"
+    if "downtime" in q or "down" in q:
+        return "simulate_downtime"
     if "priority" in q or "due this week" in q:
         return "get_priority"
     if "load" in q or "overloaded" in q or "capacity" in q:
@@ -177,28 +350,31 @@ def explain_result(question: str, data: list[dict[str, Any]]) -> str:
     rules = yaml.safe_dump(config["rules"], sort_keys=False)
     prompt = f"""{config["agent"]["role"]}
 
-Question asked:
-{question}
+    Question asked:
+    {question}
 
-Data returned:
-{payload}
+    Data returned:
+    {payload}
 
-Rules:
-{rules}
+    Rules:
+    {rules}
 """
     try:
-        return ollama_chat([{"role": "user", "content": prompt}])
+        return ollama_chat([{"role": "user", "content": prompt}], timeout=5)
     except httpx.HTTPError:
-        ids = ", ".join(str(row.get("wo_id") or row.get("machine_id")) for row in data[:5])
+        ids = ", ".join(
+            str(row.get("wo_id") or row.get("machine_id") or row.get("action") or "record")
+            for row in data[:5]
+        )
         return f"Found {len(data)} matching scheduling records: {ids}."
 
 
-def ollama_chat(messages: list[dict[str, str]]) -> str:
+def ollama_chat(messages: list[dict[str, str]], timeout: int = 30) -> str:
     """Call Ollama's chat API."""
     response = httpx.post(
         f"{OLLAMA_BASE_URL}/api/chat",
         json={"model": LLM_MODEL, "messages": messages, "stream": False},
-        timeout=30,
+        timeout=timeout,
     )
     response.raise_for_status()
     return response.json()["message"]["content"]
