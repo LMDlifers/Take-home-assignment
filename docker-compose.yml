@@ -13,8 +13,6 @@ services:
       POSTGRES_DB: scheduling_db
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./Data/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
@@ -27,10 +25,22 @@ services:
   ollama:
     image: ollama/ollama
     container_name: scheduling_ollama
-    ports:
-      - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+
+  ollama-pull:
+    image: ollama/ollama
+    container_name: scheduling_ollama_pull
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LLM_MODEL: qwen2.5:3b
+    volumes:
+      - ollama_data:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["until ollama list; do sleep 2; done; ollama pull qwen2.5:3b"]
 
   api:
     build:
@@ -46,8 +56,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-pull:
+        condition: service_completed_successfully
 
 volumes:
   pg_data:

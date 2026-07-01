@@ -70,10 +70,11 @@ def answer_question(question: str) -> dict[str, Any]:
 def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
     """Generate a safe SELECT query, execute it, and explain the result."""
     try:
-        sql = generate_sql(question)
+        generated = generate_sql(question)
     except httpx.HTTPError:
         return llm_unavailable_response(question, tool)
 
+    sql, params = generated if isinstance(generated, tuple) else (generated, ())
     if not db.is_safe_select(sql):
         return {
             "question": question,
@@ -86,19 +87,29 @@ def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
             "follow_ups": ["Which work orders are delayed?", "Show high-priority orders due this week."],
         }
 
-    data = db.fetch_all(sql)
+    data = db.fetch_all(sql, params)
     return answer_from_data(question, tool, sql, data)
 
 
 def check_load_tool(question: str) -> dict[str, Any]:
-    """Answer load questions with the deterministic machine-load view."""
-    data = logic.add_load_status(db.get_machine_loads())
+    """Answer load questions with deterministic Python load calculation."""
+    data = logic.calculate_machine_loads(db.get_machines(), db.get_open_orders())
+    if "overloaded" in question.lower():
+        data = [row for row in data if row["load_status"] == "overloaded"]
     return answer_from_data(question, "check_load", db.MACHINE_LOAD_SQL.strip(), data)
 
 
 def get_priority_tool(question: str) -> dict[str, Any]:
-    """Answer priority and due-soon questions with the priority view."""
-    data = db.get_priority_queue()
+    """Answer priority and due-soon questions with deterministic filtering."""
+    q = question.lower()
+    max_priority = 2 if re.search(r"\b(?:p2|priority\s*2|priority\s*two)\b", q) else 1
+    # ponytail: seed brief expects critical orders due by tomorrow; widen if planners need full-week P1s.
+    due_limit = 7 if max_priority == 2 else 1
+    data = [
+        row
+        for row in db.get_priority_orders()
+        if int(row["priority"]) <= max_priority and int(row["days_remaining"]) <= due_limit
+    ]
     return answer_from_data(question, "get_priority", db.PRIORITY_QUEUE_SQL.strip(), data)
 
 
@@ -136,18 +147,18 @@ def simulate_downtime_tool(question: str) -> dict[str, Any]:
             "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
         }
 
-    orders = db.get_active_orders_for_machine(machine_id)
+    orders = db.get_orders_for_simulation(machine_id)
     data = [logic.simulate_downtime(machine, orders, downtime_hours)]
     return answer_from_data(question, "simulate_downtime", None, data, confidence=0.8)
 
 
 def recommend_tool(question: str) -> dict[str, Any]:
     """Return deterministic planner actions from current risk and load data."""
-    loads = logic.add_load_status(db.get_machine_loads())
-    risks = db.get_at_risk_orders()
+    loads = logic.calculate_machine_loads(db.get_machines(), db.get_open_orders())
+    risks = logic.detect_at_risk_orders(db.get_orders_with_machine_state())
     overloaded_ids = [row["machine_id"] for row in loads if row["load_status"] == "overloaded"]
     active_by_machine = {
-        machine_id: db.get_active_orders_for_machine(machine_id)
+        machine_id: db.get_orders_for_simulation(machine_id)
         for machine_id in overloaded_ids
     }
     data = logic.recommend_actions(loads, risks, active_by_machine)
@@ -267,7 +278,7 @@ def is_planning_question(question: str) -> bool:
         re.search(r"\b(?:wo-\d+|m\d+)\b", q)
     )
 
-
+# some common words
 def route_tool(question: str) -> str:
     """Pick the visible tool name for the /ask response."""
     q = question.lower()
@@ -282,8 +293,14 @@ def route_tool(question: str) -> str:
     return "run_sql"
 
 
-def generate_sql(question: str) -> str:
-    """Ask Qwen for a SELECT query and strip common formatting noise."""
+def extract_work_order_id(question: str) -> str | None:
+    """Return the first work-order ID in a question."""
+    match = re.search(r"\bWO-\d+\b", question, flags=re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
+def generate_sql(question: str) -> tuple[str, tuple[Any, ...]]:
+    """Ask Qwen for a SELECT query and bind known user values."""
     content = ollama_chat(
         [
             {"role": "system", "content": sql_prompt()},
@@ -291,7 +308,19 @@ def generate_sql(question: str) -> str:
         ]
     )
     sql = re.sub(r"^```(?:sql)?|```$", "", content.strip(), flags=re.IGNORECASE).strip()
-    return sql.rstrip(";")
+    sql = sql.rstrip(";")
+    work_order_id = extract_work_order_id(question)
+    if work_order_id is None:
+        return sql, ()
+    if "%s" in sql:
+        return sql, (work_order_id,)
+    if "$1" in sql:
+        return sql.replace("$1", "%s"), (work_order_id,)
+
+    literal = re.compile(rf"(['\"]){re.escape(work_order_id)}\1", flags=re.IGNORECASE)
+    if literal.search(sql):
+        return literal.sub("%s", sql), (work_order_id,)
+    return sql, ()
 
 
 @lru_cache(maxsize=None)
@@ -362,11 +391,33 @@ def explain_result(question: str, data: list[dict[str, Any]]) -> str:
     try:
         return ollama_chat([{"role": "user", "content": prompt}], timeout=5)
     except httpx.HTTPError:
-        ids = ", ".join(
-            str(row.get("wo_id") or row.get("machine_id") or row.get("action") or "record")
-            for row in data[:5]
-        )
-        return f"Found {len(data)} matching scheduling records: {ids}."
+        return fallback_explanation(data)
+
+
+def fallback_explanation(data: list[dict[str, Any]]) -> str:
+    """Return a readable summary when the local LLM is unavailable."""
+    affected = [
+        str(order["wo_id"])
+        for row in data
+        for order in row.get("affected_orders", [])
+        if order.get("wo_id")
+    ]
+    if affected:
+        return f"Affected work orders: {', '.join(affected[:6])}."
+
+    actions = [str(row["action"]) for row in data if row.get("action")]
+    if actions:
+        return f"Recommended actions: {'; '.join(actions[:3])}."
+
+    work_orders = [str(row["wo_id"]) for row in data if row.get("wo_id")]
+    if work_orders:
+        return f"Work orders returned: {', '.join(work_orders[:6])}."
+
+    machines = [str(row["machine_id"]) for row in data if row.get("machine_id")]
+    if machines:
+        return f"Machines returned: {', '.join(machines[:6])}."
+
+    return f"Found {len(data)} matching scheduling records."
 
 
 def ollama_chat(messages: list[dict[str, str]], timeout: int = 30) -> str:

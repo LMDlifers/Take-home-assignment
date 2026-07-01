@@ -7,6 +7,8 @@ rules:
   - "Do not use markdown."
   - "Do not generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE."
   - "Do not generate multiple SQL statements."
+  - "Use %s placeholders for user-supplied work order or machine IDs."
+  - "Do not inline user-provided IDs like WO-1003; use placeholders."
   - "Prefer provided views when they answer the question."
   - "Use CURRENT_DATE for relative date questions like today, tomorrow, or this week."
   - "Use v_machine_load for overload and capacity questions."

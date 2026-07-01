@@ -1,6 +1,7 @@
 # AI Planning Copilot for Shop Floor Scheduling
 
-Backend-only FastAPI project for the A*Star take-home assignment.
+FastAPI project for the A*Star take-home assignment, with a tiny plain HTML
+test UI served by the API.
 
 Current status: deterministic backend endpoints and the `/api/v1/ask` tool
 router are implemented. The app can be containerised with PostgreSQL and
@@ -14,7 +15,7 @@ use Qwen to generate read-only SQL for open-ended SQL questions.
 - Docker Compose setup for:
   - `api` - FastAPI service
   - `db` - PostgreSQL database
-  - `ollama` - local LLM service for later phases
+  - `ollama` - local LLM service using `qwen2.5:3b`
 - Health endpoint:
   - `GET /api/v1/health`
 - Deterministic scheduling endpoints:
@@ -23,13 +24,15 @@ use Qwen to generate read-only SQL for open-ended SQL questions.
   - `POST /api/v1/simulate/downtime`
 - GenAI endpoint:
   - `POST /api/v1/ask`
+- Test UI:
+  - `GET /ui/`
 - Basic health tests in `Backend/tests/`
 
 `/api/v1/ask` routes questions to simple tools:
 
 - `run_sql` - Qwen generates one safe PostgreSQL `SELECT` query.
-- `check_load` - deterministic query against `v_machine_load`.
-- `get_priority` - deterministic query against `v_priority_queue`.
+- `check_load` - deterministic Python load calculation from machine and order rows.
+- `get_priority` - deterministic Python priority filtering from live order rows.
 - `simulate_downtime` - deterministic Python simulation after reading machine/order data.
 - `recommend` - deterministic recommendations from load and risk data.
 - `refuse` - out-of-scope questions.
@@ -47,6 +50,8 @@ Take-home-assignment/
   requirements.txt
   Data/
     seed.sql
+  frontend/
+    index.html
   Backend/
     Dockerfile
     app/
@@ -92,6 +97,18 @@ Swagger docs:
 
 ```text
 http://localhost:8000/docs
+```
+
+Plain HTML test UI:
+
+```text
+http://localhost:8000/ui/
+```
+
+On the same Wi-Fi/LAN, another user can open the UI with your machine's IP:
+
+```text
+http://<your-mac-lan-ip>:8000/ui/
 ```
 
 ## Health Check
@@ -149,15 +166,22 @@ docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT COUNT
 
 The count should be greater than `0`.
 
-## Pull The Local LLM
+## Local LLM Model
 
-After the Ollama container is running, pull the model once:
+Docker Compose pulls the configured model automatically through the
+`ollama-pull` service:
+
+```text
+qwen2.5:3b
+```
+
+If the first startup is interrupted, this troubleshooting command is safe to run:
 
 ```powershell
 docker exec -it scheduling_ollama ollama pull qwen2.5:3b
 ```
 
-Then test `/ask`:
+Test `/ask`:
 
 ```powershell
 curl -X POST http://localhost:8000/api/v1/ask -H "Content-Type: application/json" -d "{\"question\":\"Which work orders are delayed?\"}"
@@ -178,6 +202,58 @@ Why is WO-1003 at risk?
 What happens if M2 is down for 4 extra hours?
 Show high-priority orders due this week.
 Recommend actions to reduce delays.
+```
+
+Example `/api/v1/ask` response:
+
+```json
+{
+  "question": "Which machines are overloaded?",
+  "tool_used": "check_load",
+  "sql_used": "SELECT machine_id, machine_name, machine_type, capacity_hours_day,\n       available_hours_today, current_status, queued_hours, load_pct\nFROM v_machine_load\nORDER BY load_pct DESC NULLS LAST, machine_id ASC",
+  "data": [
+    {
+      "machine_id": "M3",
+      "machine_name": "Hydraulic Press Line 1",
+      "machine_type": "Press",
+      "capacity_hours_day": 10.0,
+      "available_hours_today": 10.0,
+      "current_status": "available",
+      "queued_hours": 19.0,
+      "load_pct": 190.0,
+      "load_status": "overloaded"
+    },
+    {
+      "machine_id": "M6",
+      "machine_name": "Vertical Milling Machine 1",
+      "machine_type": "Mill",
+      "capacity_hours_day": 6.0,
+      "available_hours_today": 6.0,
+      "current_status": "available",
+      "queued_hours": 7.5,
+      "load_pct": 125.0,
+      "load_status": "overloaded"
+    },
+    {
+      "machine_id": "M5",
+      "machine_name": "Laser Cutter 500W",
+      "machine_type": "Laser",
+      "capacity_hours_day": 7.5,
+      "available_hours_today": 7.5,
+      "current_status": "available",
+      "queued_hours": 8.0,
+      "load_pct": 106.7,
+      "load_status": "overloaded"
+    }
+  ],
+  "answer": "Machines returned: M3, M6, M5.",
+  "explanation": "Machines returned: M3, M6, M5.",
+  "confidence": 0.75,
+  "follow_ups": [
+    "Which machines are causing the most delays?",
+    "Show high-priority orders due this week."
+  ]
+}
 ```
 
 ## Audit Logging
@@ -228,7 +304,8 @@ Blueprint configuration notes:
 After installing dependencies:
 
 ```powershell
-python -m pytest Backend\tests
+python3 -m pip install -r requirements.txt
+python3 -m pytest Backend/tests -q
 ```
 
 Inside the API container after rebuilding:
@@ -236,3 +313,10 @@ Inside the API container after rebuilding:
 ```powershell
 docker exec -it scheduling_api pytest tests
 ```
+
+## Known Limitations
+
+- The UI is intentionally minimal: plain HTML and browser JavaScript only.
+- No multi-turn conversation memory.
+- Tool selection is keyword-based by design.
+- First Docker startup downloads Ollama and `qwen2.5:3b`, so it can take time.

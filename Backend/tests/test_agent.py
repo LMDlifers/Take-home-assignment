@@ -1,3 +1,5 @@
+from datetime import date
+
 import psycopg
 import pytest
 
@@ -10,7 +12,7 @@ def no_audit_log(monkeypatch) -> None:
     monkeypatch.setattr(db, "log_agent_action", lambda **kwargs: None)
 
 
-def fail_if_generate_sql_called(question: str) -> str:
+def fail_if_generate_sql_called(question: str) -> tuple[str, tuple]:
     raise AssertionError("deterministic tool should not generate SQL with Qwen")
 
 
@@ -24,6 +26,29 @@ def capture_audit_logs(monkeypatch) -> list[dict]:
     return logs
 
 
+def sample_machines() -> list[dict]:
+    return [
+        {"machine_id": "M3", "machine_name": "Hydraulic Press Line 1", "machine_type": "Press", "capacity_hours_day": 10, "available_hours_today": 10, "current_status": "available"},
+        {"machine_id": "M6", "machine_name": "Vertical Milling Machine 1", "machine_type": "Mill", "capacity_hours_day": 6, "available_hours_today": 6, "current_status": "available"},
+        {"machine_id": "M5", "machine_name": "Laser Cutter 500W", "machine_type": "Laser", "capacity_hours_day": 7.5, "available_hours_today": 7.5, "current_status": "available"},
+        {"machine_id": "M4", "machine_name": "Hydraulic Press Line 2", "machine_type": "Press", "capacity_hours_day": 10, "available_hours_today": 0, "current_status": "unavailable"},
+        {"machine_id": "M2", "machine_name": "CNC Machining Centre Beta", "machine_type": "CNC Mill", "capacity_hours_day": 8, "available_hours_today": 4.5, "current_status": "partial"},
+    ]
+
+
+def sample_open_orders() -> list[dict]:
+    return [
+        {"wo_id": "WO-1002", "required_machine": "M3", "processing_time_hr": 9, "priority": 1, "status": "in_progress"},
+        {"wo_id": "WO-1007", "required_machine": "M3", "processing_time_hr": 7, "priority": 1, "status": "pending"},
+        {"wo_id": "WO-1016", "required_machine": "M3", "processing_time_hr": 3, "priority": 2, "status": "pending"},
+        {"wo_id": "WO-1011", "required_machine": "M6", "processing_time_hr": 3.5, "priority": 3, "status": "pending"},
+        {"wo_id": "WO-1015", "required_machine": "M6", "processing_time_hr": 4, "priority": 1, "status": "pending"},
+        {"wo_id": "WO-1006", "required_machine": "M5", "processing_time_hr": 3, "priority": 2, "status": "in_progress"},
+        {"wo_id": "WO-1013", "required_machine": "M5", "processing_time_hr": 2, "priority": 4, "status": "pending"},
+        {"wo_id": "WO-1019", "required_machine": "M5", "processing_time_hr": 3, "priority": 1, "status": "pending"},
+    ]
+
+
 def test_out_of_scope_question_is_refused() -> None:
     response = agent.answer_question("What is the capital of France?")
 
@@ -31,9 +56,18 @@ def test_out_of_scope_question_is_refused() -> None:
     assert response["data"] == []
 
 
+def test_six_assessment_questions_route_to_expected_tools() -> None:
+    assert agent.route_tool("Which work orders are delayed?") == "run_sql"
+    assert agent.route_tool("Which machines are overloaded?") == "check_load"
+    assert agent.route_tool("Why is WO-1003 at risk?") == "run_sql"
+    assert agent.route_tool("What happens if M2 is down for 4 extra hours?") == "simulate_downtime"
+    assert agent.route_tool("Show high-priority orders due this week.") == "get_priority"
+    assert agent.route_tool("Recommend actions to reduce delays.") == "recommend"
+
+
 def test_ask_uses_generated_safe_sql(monkeypatch) -> None:
-    monkeypatch.setattr(agent, "generate_sql", lambda question: "SELECT wo_id FROM work_orders")
-    monkeypatch.setattr(db, "fetch_all", lambda sql: [{"wo_id": "WO-1003"}])
+    monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT wo_id FROM work_orders", ()))
+    monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
     response = agent.answer_question("Which work orders are delayed?")
@@ -45,8 +79,8 @@ def test_ask_uses_generated_safe_sql(monkeypatch) -> None:
 
 def test_successful_run_sql_is_logged(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
-    monkeypatch.setattr(agent, "generate_sql", lambda question: "SELECT wo_id FROM work_orders")
-    monkeypatch.setattr(db, "fetch_all", lambda sql: [{"wo_id": "WO-1003"}])
+    monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT wo_id FROM work_orders", ()))
+    monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
     agent.answer_question("Which work orders are delayed?")
@@ -61,50 +95,22 @@ def test_successful_run_sql_is_logged(monkeypatch) -> None:
 def test_check_load_tool_uses_deterministic_query(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "M3 is overloaded.")
-    monkeypatch.setattr(
-        db,
-        "get_machine_loads",
-        lambda: [
-            {
-                "machine_id": "M3",
-                "machine_name": "Hydraulic Press Line 1",
-                "machine_type": "Press",
-                "capacity_hours_day": 10,
-                "available_hours_today": 10,
-                "current_status": "available",
-                "queued_hours": 19,
-                "load_pct": 190,
-            }
-        ],
-    )
+    monkeypatch.setattr(db, "get_machines", sample_machines)
+    monkeypatch.setattr(db, "get_open_orders", sample_open_orders)
 
     response = agent.answer_question("Which machines are overloaded?")
 
     assert response["tool_used"] == "check_load"
     assert "v_machine_load" in response["sql_used"]
-    assert response["data"][0]["load_status"] == "overloaded"
+    assert [row["machine_id"] for row in response["data"]] == ["M3", "M6", "M5"]
 
 
 def test_check_load_is_logged_as_query_generated(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "M3 is overloaded.")
-    monkeypatch.setattr(
-        db,
-        "get_machine_loads",
-        lambda: [
-            {
-                "machine_id": "M3",
-                "machine_name": "Hydraulic Press Line 1",
-                "machine_type": "Press",
-                "capacity_hours_day": 10,
-                "available_hours_today": 10,
-                "current_status": "available",
-                "queued_hours": 19,
-                "load_pct": 190,
-            }
-        ],
-    )
+    monkeypatch.setattr(db, "get_machines", lambda: [sample_machines()[0]])
+    monkeypatch.setattr(db, "get_open_orders", lambda: sample_open_orders()[:3])
 
     agent.answer_question("Which machines are overloaded?")
 
@@ -117,7 +123,7 @@ def test_get_priority_tool_uses_priority_view(monkeypatch) -> None:
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "High-priority orders are due soon.")
     monkeypatch.setattr(
         db,
-        "get_priority_queue",
+        "get_priority_orders",
         lambda: [{"wo_id": "WO-1001", "priority": 1, "days_remaining": 1}],
     )
 
@@ -126,6 +132,36 @@ def test_get_priority_tool_uses_priority_view(monkeypatch) -> None:
     assert response["tool_used"] == "get_priority"
     assert "v_priority_queue" in response["sql_used"]
     assert response["data"][0]["wo_id"] == "WO-1001"
+
+
+def test_get_priority_tool_returns_expected_p1_due_this_week(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(agent, "explain_result", lambda question, data: "P1 orders are due soon.")
+    monkeypatch.setattr(
+        db,
+        "get_priority_orders",
+        lambda: [
+            {"wo_id": "WO-1001", "priority": 1, "days_remaining": 1},
+            {"wo_id": "WO-1002", "priority": 1, "days_remaining": 0},
+            {"wo_id": "WO-1003", "priority": 1, "days_remaining": 0},
+            {"wo_id": "WO-1005", "priority": 1, "days_remaining": -1},
+            {"wo_id": "WO-1007", "priority": 1, "days_remaining": 1},
+            {"wo_id": "WO-1015", "priority": 1, "days_remaining": 1},
+            {"wo_id": "WO-1019", "priority": 1, "days_remaining": 2},
+            {"wo_id": "WO-1008", "priority": 2, "days_remaining": 1},
+        ],
+    )
+
+    response = agent.answer_question("Show high-priority orders due this week.")
+
+    assert [row["wo_id"] for row in response["data"]] == [
+        "WO-1001",
+        "WO-1002",
+        "WO-1003",
+        "WO-1005",
+        "WO-1007",
+        "WO-1015",
+    ]
 
 
 def test_simulate_downtime_tool_parses_machine_and_hours(monkeypatch) -> None:
@@ -138,7 +174,7 @@ def test_simulate_downtime_tool_parses_machine_and_hours(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         db,
-        "get_active_orders_for_machine",
+        "get_orders_for_simulation",
         lambda machine_id: [
             {
                 "wo_id": "WO-1008",
@@ -169,7 +205,7 @@ def test_simulate_downtime_is_logged_as_simulation(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         db,
-        "get_active_orders_for_machine",
+        "get_orders_for_simulation",
         lambda machine_id: [{"wo_id": "WO-1008", "processing_time_hr": 5.5}],
     )
 
@@ -183,38 +219,29 @@ def test_simulate_downtime_is_logged_as_simulation(monkeypatch) -> None:
 def test_recommend_tool_uses_deterministic_rules(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "Escalate M4 and rebalance M5.")
+    monkeypatch.setattr(db, "get_machines", sample_machines)
+    monkeypatch.setattr(db, "get_open_orders", sample_open_orders)
     monkeypatch.setattr(
         db,
-        "get_machine_loads",
-        lambda: [
-            {
-                "machine_id": "M5",
-                "machine_name": "Laser Cutter 500W",
-                "machine_type": "Laser",
-                "capacity_hours_day": 7.5,
-                "available_hours_today": 7.5,
-                "current_status": "available",
-                "queued_hours": 8,
-                "load_pct": 106,
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        db,
-        "get_at_risk_orders",
+        "get_orders_with_machine_state",
         lambda: [
             {
                 "wo_id": "WO-1003",
+                "product_code": "PART-C",
+                "quantity": 60,
                 "required_machine": "M4",
+                "processing_time_hr": 5,
+                "priority": 1,
+                "due_date": date(2026, 6, 30),
                 "status": "delayed",
+                "available_hours_today": 0,
                 "machine_status": "unavailable",
-                "risk_reason": "Machine unavailable",
             }
         ],
     )
     monkeypatch.setattr(
         db,
-        "get_active_orders_for_machine",
+        "get_orders_for_simulation",
         lambda machine_id: [{"wo_id": "WO-1013", "priority": 4}],
     )
 
@@ -228,46 +255,37 @@ def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "Escalate M4.")
+    monkeypatch.setattr(db, "get_machines", lambda: [sample_machines()[2]])
+    monkeypatch.setattr(db, "get_open_orders", lambda: sample_open_orders()[5:])
     monkeypatch.setattr(
         db,
-        "get_machine_loads",
-        lambda: [
-            {
-                "machine_id": "M5",
-                "machine_name": "Laser Cutter 500W",
-                "machine_type": "Laser",
-                "capacity_hours_day": 7.5,
-                "available_hours_today": 7.5,
-                "current_status": "available",
-                "queued_hours": 8,
-                "load_pct": 106,
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        db,
-        "get_at_risk_orders",
+        "get_orders_with_machine_state",
         lambda: [
             {
                 "wo_id": "WO-1003",
+                "product_code": "PART-C",
+                "quantity": 60,
                 "required_machine": "M4",
+                "processing_time_hr": 5,
+                "priority": 1,
+                "due_date": date(2026, 6, 30),
                 "status": "delayed",
+                "available_hours_today": 0,
                 "machine_status": "unavailable",
-                "risk_reason": "Machine unavailable",
             }
         ],
     )
-    monkeypatch.setattr(db, "get_active_orders_for_machine", lambda machine_id: [])
+    monkeypatch.setattr(db, "get_orders_for_simulation", lambda machine_id: [])
 
     agent.answer_question("Recommend actions to reduce delays.")
 
     assert logs[0]["action_type"] == "recommendation"
     assert logs[0]["sql_generated"] is None
-    assert logs[0]["result_summary"].startswith("Generated 2 recommendations:")
+    assert logs[0]["result_summary"].startswith("Generated 1 recommendations:")
 
 
 def test_unsafe_generated_sql_is_rejected(monkeypatch) -> None:
-    monkeypatch.setattr(agent, "generate_sql", lambda question: "DELETE FROM work_orders")
+    monkeypatch.setattr(agent, "generate_sql", lambda question: ("DELETE FROM work_orders", ()))
 
     response = agent.answer_question("Which work orders are delayed?")
 
@@ -299,6 +317,48 @@ def test_logging_failure_does_not_break_response(monkeypatch) -> None:
 def test_sql_safety_rejects_multiple_statements() -> None:
     assert db.is_safe_select("SELECT * FROM work_orders") is True
     assert db.is_safe_select("SELECT * FROM work_orders; DROP TABLE work_orders") is False
+    assert db.is_safe_select("SELECT * FROM work_orders -- hidden") is False
+    assert db.is_safe_select("SELECT * FROM work_orders /* hidden */") is False
+    assert db.is_safe_select("") is False
+
+
+def test_generate_sql_binds_work_order_literals(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = 'WO-1003'",
+    )
+
+    sql, params = agent.generate_sql("Why is WO-1003 at risk?")
+
+    assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
+    assert params == ("WO-1003",)
+
+
+def test_generate_sql_converts_dollar_placeholder(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = $1",
+    )
+
+    sql, params = agent.generate_sql("Why is WO-1003 at risk?")
+
+    assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
+    assert params == ("WO-1003",)
+
+
+def test_generate_sql_binds_existing_percent_placeholder(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = %s",
+    )
+
+    sql, params = agent.generate_sql("Why is WO-1003 at risk?")
+
+    assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
+    assert params == ("WO-1003",)
 
 
 def test_prompt_files_load() -> None:

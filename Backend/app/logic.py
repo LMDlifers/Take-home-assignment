@@ -5,6 +5,7 @@ recommendation helpers in testable Python code instead of relying on the LLM for
 core correctness.
 """
 
+from datetime import date
 from typing import Any
 
 
@@ -25,6 +26,62 @@ def add_load_status(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         item["load_status"] = load_status(float(item["load_pct"] or 0))
         labelled.append(item)
     return labelled
+
+
+def calculate_machine_loads(
+    machines: list[dict[str, Any]],
+    orders: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Calculate queued machine load in application code."""
+    queued_by_machine = {machine["machine_id"]: 0.0 for machine in machines}
+    for order in orders:
+        if order["status"] in {"pending", "in_progress"}:
+            queued_by_machine[order["required_machine"]] += float(order["processing_time_hr"])
+
+    rows = []
+    for machine in machines:
+        capacity = float(machine["capacity_hours_day"])
+        queued = queued_by_machine[machine["machine_id"]]
+        load_pct = round(queued / capacity * 100, 1) if capacity else 0
+        row = dict(machine)
+        row["queued_hours"] = queued
+        row["load_pct"] = load_pct
+        row["load_status"] = load_status(load_pct)
+        rows.append(row)
+
+    return sorted(rows, key=lambda row: (-float(row["load_pct"]), row["machine_id"]))
+
+
+def detect_at_risk_orders(
+    rows: list[dict[str, Any]],
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Detect delayed, blocked, and capacity-risk orders in application code."""
+    today = today or date.today()
+    risks = []
+    for row in rows:
+        status = row["status"]
+        due_date = row["due_date"]
+        machine_status = row["machine_status"]
+        over_available = float(row["processing_time_hr"]) > float(row["available_hours_today"])
+        due_now = status in {"pending", "in_progress"} and due_date <= today
+        blocked = status == "pending" and machine_status == "unavailable"
+
+        if status != "delayed" and not due_now and not blocked and not over_available:
+            continue
+
+        item = dict(row)
+        if machine_status == "unavailable":
+            item["risk_reason"] = "Machine unavailable - cannot schedule"
+        elif over_available:
+            item["risk_reason"] = "Processing time exceeds available machine hours today"
+        elif due_date <= today:
+            item["risk_reason"] = "Due date passed and not completed"
+        else:
+            item["risk_reason"] = "Order is already flagged delayed"
+        risks.append(item)
+
+    return sorted(risks, key=lambda row: (int(row["priority"]), row["due_date"], row["wo_id"]))
 
 
 def simulate_downtime(
@@ -108,19 +165,10 @@ def recommend_actions(
         if low_priority:
             recommendations.append(
                 {
-                    "action": f"Move low-priority work off {machine_id}",
+                    "action": f"Reschedule low-priority work off {machine_id}",
                     "machine_id": machine_id,
                     "affected_work_orders": low_priority,
                     "reason": "Machine is overloaded; move lower-priority work to protect urgent orders.",
-                }
-            )
-        else:
-            recommendations.append(
-                {
-                    "action": f"Rebalance queue on {machine_id}",
-                    "machine_id": machine_id,
-                    "load_pct": machine["load_pct"],
-                    "reason": "Queued work exceeds daily capacity.",
                 }
             )
 
