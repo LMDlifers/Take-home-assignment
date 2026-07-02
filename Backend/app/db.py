@@ -35,6 +35,15 @@ FROM v_at_risk_orders
 ORDER BY priority ASC, due_date ASC, wo_id ASC
 """
 
+AT_RISK_ORDER_SQL = """
+SELECT wo_id, product_code, quantity, required_machine,
+       processing_time_hr, priority, due_date, status,
+       available_hours_today, machine_status, risk_reason
+FROM v_at_risk_orders
+WHERE wo_id = %s
+ORDER BY priority ASC, due_date ASC, wo_id ASC
+"""
+
 # Query to rank incomplete work orders due within the next 3 days
 PRIORITY_QUEUE_SQL = """
 SELECT wo_id, product_code, product_name, quantity, required_machine,
@@ -72,10 +81,12 @@ def is_safe_select(sql: str) -> bool:
     if not cleaned:
         return False
     statement = cleaned[:-1].strip() if cleaned.endswith(";") else cleaned
+    # Require one read-only SELECT statement.
     if not re.match(r"SELECT\b", statement, flags=re.IGNORECASE):
         return False
     if ";" in statement or "--" in statement or "/*" in statement or "*/" in statement:
         return False
+    # Block dangerous SQL verbs only when they appear as standalone words.
     return not any(
         re.search(rf"\b{word}\b", statement, flags=re.IGNORECASE)
         for word in FORBIDDEN_SQL
@@ -90,6 +101,11 @@ def get_machine_loads() -> list[dict[str, Any]]:
 def get_at_risk_orders() -> list[dict[str, Any]]:
     """Return at-risk work orders from the seeded view."""
     return fetch_all(AT_RISK_ORDERS_SQL)
+
+
+def get_at_risk_order(wo_id: str) -> list[dict[str, Any]]:
+    """Return one at-risk work order from the seeded view."""
+    return fetch_all(AT_RISK_ORDER_SQL, (wo_id,))
 
 
 def get_priority_queue() -> list[dict[str, Any]]:

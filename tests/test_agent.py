@@ -284,6 +284,30 @@ def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
     assert logs[0]["result_summary"].startswith("Generated 1 recommendations:")
 
 
+def test_work_order_risk_question_uses_deterministic_view(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is blocked on M4.")
+    monkeypatch.setattr(
+        db,
+        "get_at_risk_order",
+        lambda wo_id: [
+            {
+                "wo_id": wo_id,
+                "required_machine": "M4",
+                "machine_status": "unavailable",
+                "risk_reason": "Machine M4 is unavailable",
+            }
+        ],
+    )
+
+    response = agent.answer_question("Why is WO-1003 at risk?")
+
+    assert response["tool_used"] == "run_sql"
+    assert "v_at_risk_orders" in response["sql_used"]
+    assert response["data"][0]["wo_id"] == "WO-1003"
+    assert response["answer"] == "WO-1003 is blocked on M4."
+
+
 def test_unsafe_generated_sql_is_rejected(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", lambda question: ("DELETE FROM work_orders", ()))
 
@@ -322,43 +346,104 @@ def test_sql_safety_rejects_multiple_statements() -> None:
     assert db.is_safe_select("") is False
 
 
-def test_generate_sql_binds_work_order_literals(monkeypatch) -> None:
-    monkeypatch.setattr(
-        agent,
-        "ollama_chat",
-        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = 'WO-1003'",
-    )
+def test_generate_sql_uses_structured_output(monkeypatch) -> None:
+    calls = []
+
+    def fake_ollama_chat(messages, **kwargs):
+        calls.append(kwargs)
+        return '{"query":"SELECT wo_id FROM work_orders WHERE wo_id = %s","params":["WO-1003"]}'
+
+    monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
 
     sql, params = agent.generate_sql("Why is WO-1003 at risk?")
 
     assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
     assert params == ("WO-1003",)
+    assert calls[0]["model"] == agent.LLM_SQL_MODEL
+    assert calls[0]["format_schema"] == agent.SQLResponse.model_json_schema()
+    assert calls[0]["options"] == {"temperature": 0}
 
 
-def test_generate_sql_converts_dollar_placeholder(monkeypatch) -> None:
+def test_explain_result_uses_explanation_model(monkeypatch) -> None:
+    calls = []
+
+    def fake_ollama_chat(messages, **kwargs):
+        calls.append(kwargs)
+        return "WO-1003 is blocked on M4."
+
+    monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
+
+    answer = agent.explain_result(
+        "Why is WO-1003 at risk?",
+        [{"wo_id": "WO-1003", "required_machine": "M4", "risk_reason": "Machine unavailable"}],
+    )
+
+    assert answer == "WO-1003 is blocked on M4."
+    assert calls[0]["model"] == agent.LLM_EXPLANATION_MODEL
+
+
+def test_generate_sql_rejects_markdown_fenced_output(monkeypatch) -> None:
     monkeypatch.setattr(
         agent,
         "ollama_chat",
-        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = $1",
+        lambda messages, **kwargs: "```json\n{\"query\":\"SELECT wo_id FROM work_orders\",\"params\":[]}\n```",
     )
 
-    sql, params = agent.generate_sql("Why is WO-1003 at risk?")
-
-    assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
-    assert params == ("WO-1003",)
+    with pytest.raises(agent.ValidationError):
+        agent.generate_sql("Which work orders are delayed?")
 
 
-def test_generate_sql_binds_existing_percent_placeholder(monkeypatch) -> None:
+def test_generate_sql_rejects_dollar_placeholder(monkeypatch) -> None:
     monkeypatch.setattr(
         agent,
         "ollama_chat",
-        lambda messages: "SELECT wo_id FROM work_orders WHERE wo_id = %s",
+        lambda messages, **kwargs: '{"query":"SELECT wo_id FROM work_orders WHERE wo_id = $1","params":["WO-1003"]}',
     )
 
-    sql, params = agent.generate_sql("Why is WO-1003 at risk?")
+    with pytest.raises(ValueError, match="not \\$1"):
+        agent.generate_sql("Why is WO-1003 at risk?")
 
-    assert sql == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
-    assert params == ("WO-1003",)
+
+def test_generate_sql_rejects_placeholder_param_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages, **kwargs: '{"query":"SELECT wo_id FROM work_orders WHERE wo_id = %s","params":[]}',
+    )
+
+    with pytest.raises(ValueError, match="placeholder count"):
+        agent.generate_sql("Why is WO-1003 at risk?")
+
+
+def test_generate_sql_rejects_quoted_placeholder(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages, **kwargs: '{"query":"SELECT wo_id FROM work_orders WHERE wo_id = \'%s\'","params":["WO-1003"]}',
+    )
+
+    with pytest.raises(ValueError, match="Do not quote"):
+        agent.generate_sql("Why is WO-1003 at risk?")
+
+
+def test_db_error_returns_safe_run_sql_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "generate_sql",
+        lambda question: ("SELECT wo_id FROM work_orders WHERE wo_id = %s", ("WO-1003",)),
+    )
+
+    def broken_fetch_all(sql, params=()):
+        raise psycopg.ProgrammingError("bad generated SQL")
+
+    monkeypatch.setattr(db, "fetch_all", broken_fetch_all)
+
+    response = agent.answer_question("Which work orders are delayed?")
+
+    assert response["tool_used"] == "run_sql"
+    assert response["sql_used"] == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
+    assert response["data"] == []
+    assert response["confidence"] == 0.2
 
 
 def test_prompt_files_load() -> None:

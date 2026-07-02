@@ -6,7 +6,7 @@ test UI served by the API.
 Current status: deterministic backend endpoints and the `/api/v1/ask` tool
 router are implemented. The app can be containerised with PostgreSQL and
 Ollama, query seeded scheduling data, run deterministic scheduling tools, and
-use Qwen to generate read-only SQL for open-ended SQL questions.
+use Qwen to generate read-only SQL and Llama to explain returned data.
 
 ## What Exists So Far
 
@@ -15,7 +15,7 @@ use Qwen to generate read-only SQL for open-ended SQL questions.
 - Docker Compose setup for:
   - `api` - FastAPI service
   - `db` - PostgreSQL database
-  - `ollama` - local LLM service using `qwen2.5:3b`
+  - `ollama` - local LLM service using `qwen2.5:3b` and `llama3.1:8b`
 - Health endpoint:
   - `GET /api/v1/health`
 - Deterministic scheduling endpoints:
@@ -26,7 +26,7 @@ use Qwen to generate read-only SQL for open-ended SQL questions.
   - `POST /api/v1/ask`
 - Test UI:
   - `GET /ui/`
-- Basic health tests in `Backend/tests/`
+- Basic health tests in `tests/`
 
 `/api/v1/ask` routes questions to simple tools:
 
@@ -38,8 +38,8 @@ use Qwen to generate read-only SQL for open-ended SQL questions.
 - `refuse` - out-of-scope questions.
 
 Qwen is used for SQL generation only in the `run_sql` path. Other tools use
-deterministic code first, then Qwen may explain the returned data. If Qwen is
-unavailable during explanation, the API returns a simple fallback summary.
+deterministic code first, then Llama may explain the returned data. If the
+explanation model is unavailable, the API returns a simple fallback summary.
 Each `/api/v1/ask` request writes a best-effort audit row to `agent_action_log`.
 
 ## Project Structure
@@ -64,13 +64,14 @@ Take-home-assignment/
       schema_context.yaml
       sql_generation.yaml
       explanation.yaml
-    tests/
-      conftest.py
-      test_health.py
-      test_logic.py
-      test_routes.py
-      test_agent.py
-      test_db.py
+  tests/
+    conftest.py
+    test_health.py
+    test_logic.py
+    test_routes.py
+    test_agent.py
+    test_db.py
+    pdf_conformance_check.ipynb
 ```
 
 ## Run With Docker
@@ -168,17 +169,19 @@ The count should be greater than `0`.
 
 ## Local LLM Model
 
-Docker Compose pulls the configured model automatically through the
+Docker Compose pulls the configured models automatically through the
 `ollama-pull` service:
 
 ```text
 qwen2.5:3b
+llama3.1:8b
 ```
 
 If the first startup is interrupted, this troubleshooting command is safe to run:
 
 ```powershell
 docker exec -it scheduling_ollama ollama pull qwen2.5:3b
+docker exec -it scheduling_ollama ollama pull llama3.1:8b
 ```
 
 Test `/ask`:
@@ -286,16 +289,16 @@ Backend/prompts/
 
 - `schema_context.yaml` contains table meanings, known values, views, and business rules.
 - `sql_generation.yaml` contains Qwen SQL-generation role and safety instructions.
-- `explanation.yaml` contains Qwen explanation style and fallback wording.
+- `explanation.yaml` contains Llama explanation style and fallback wording.
 
-The YAML files guide Qwen only. SQL execution safety is still enforced in Python
-by `db.is_safe_select()`.
+The YAML files guide the local models only. SQL execution safety is still
+enforced in Python by `db.is_safe_select()`.
 
 Blueprint configuration notes:
 
 - Prompt context node: loads `schema_context.yaml`; context only, no SQL enforcement.
 - SQL generation node: loads `sql_generation.yaml`; Qwen generates candidate `SELECT` SQL for the `run_sql` path only.
-- Explanation node: loads `explanation.yaml`; Qwen explains retrieved rows, with fallback wording if needed.
+- Explanation node: loads `explanation.yaml`; Llama explains retrieved rows, with fallback wording if needed.
 - SQL safety node: Python rejects non-SELECT SQL, destructive SQL, and multiple statements before execution.
 - Known values: enum/category-like values live in YAML; live operational records stay in PostgreSQL.
 
@@ -305,7 +308,7 @@ After installing dependencies:
 
 ```powershell
 python3 -m pip install -r requirements.txt
-python3 -m pytest Backend/tests -q
+python3 -m pytest tests -q
 ```
 
 Inside the API container after rebuilding:
@@ -319,4 +322,4 @@ docker exec -it scheduling_api pytest tests
 - The UI is intentionally minimal: plain HTML and browser JavaScript only.
 - No multi-turn conversation memory.
 - Tool selection is keyword-based by design.
-- First Docker startup downloads Ollama and `qwen2.5:3b`, so it can take time.
+- First Docker startup downloads Ollama, `qwen2.5:3b`, and `llama3.1:8b`, so it can take time.

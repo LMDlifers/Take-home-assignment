@@ -33,14 +33,15 @@ services:
     container_name: scheduling_ollama_pull
     environment:
       OLLAMA_HOST: http://ollama:11434
-      LLM_MODEL: qwen2.5:3b
+      LLM_SQL_MODEL: qwen2.5:3b
+      LLM_EXPLANATION_MODEL: llama3.1:8b
     volumes:
       - ollama_data:/root/.ollama
     depends_on:
       ollama:
         condition: service_started
     entrypoint: ["/bin/sh", "-c"]
-    command: ["until ollama list; do sleep 2; done; ollama pull qwen2.5:3b"]
+    command: ["until ollama list; do sleep 2; done; ollama pull qwen2.5:3b; ollama pull llama3.1:8b"]
 
   api:
     build:
@@ -50,7 +51,8 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/scheduling_db
       OLLAMA_BASE_URL: http://ollama:11434
-      LLM_MODEL: qwen2.5:3b
+      LLM_SQL_MODEL: qwen2.5:3b
+      LLM_EXPLANATION_MODEL: llama3.1:8b
     ports:
       - "8000:8000"
     depends_on:

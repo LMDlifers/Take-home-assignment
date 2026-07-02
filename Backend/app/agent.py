@@ -16,12 +16,26 @@ from typing import Any
 import httpx
 import psycopg
 import yaml
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import ValidationError
 
 from app import db
 from app import logic
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+LLM_SQL_MODEL = os.getenv("LLM_SQL_MODEL", os.getenv("LLM_MODEL", "qwen2.5:3b"))
+LLM_EXPLANATION_MODEL = os.getenv("LLM_EXPLANATION_MODEL", "llama3.1:8b")
+
+
+class SQLResponse(BaseModel):
+    """Structured response expected from Ollama SQL generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    params: list[str | int | float] = Field(default_factory=list)
 
 SCHEDULING_TERMS = {
     "machine",
@@ -44,13 +58,14 @@ SCHEDULING_TERMS = {
 
 def answer_question(question: str) -> dict[str, Any]:
     """Answer one natural-language planning question."""
-    session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4()) # for recording into agent_action_log database
 
     if not is_planning_question(question):
         response = refuse_response(question)
         safe_log_action(session_id, response)
         return response
 
+    # routing is currently keyword driven 
     tool = route_tool(question)
     if tool == "check_load":
         response = check_load_tool(question)
@@ -60,6 +75,8 @@ def answer_question(question: str) -> dict[str, Any]:
         response = simulate_downtime_tool(question)
     elif tool == "recommend":
         response = recommend_tool(question)
+    elif is_work_order_risk_question(question):
+        response = work_order_risk_tool(question)
     else:
         response = run_sql_tool(question, tool)
 
@@ -70,24 +87,20 @@ def answer_question(question: str) -> dict[str, Any]:
 def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
     """Generate a safe SELECT query, execute it, and explain the result."""
     try:
-        generated = generate_sql(question)
+        generated = generate_sql(question) # Uses LLM
     except httpx.HTTPError:
         return llm_unavailable_response(question, tool)
+    except (ValueError, ValidationError) as error:
+        return sql_error_response(question, tool, explanation=str(error))
 
     sql, params = generated if isinstance(generated, tuple) else (generated, ())
     if not db.is_safe_select(sql):
-        return {
-            "question": question,
-            "tool_used": tool,
-            "sql_used": sql,
-            "data": [],
-            "answer": "I could not generate a safe read-only query for that question.",
-            "explanation": "The generated query was rejected before execution.",
-            "confidence": 0.2,
-            "follow_ups": ["Which work orders are delayed?", "Show high-priority orders due this week."],
-        }
+        return sql_error_response(question, tool, sql, "The generated query was rejected before execution.")
 
-    data = db.fetch_all(sql, params)
+    try:
+        data = db.fetch_all(sql, params)
+    except (ValueError, psycopg.Error) as error:
+        return sql_error_response(question, tool, sql, f"The generated query could not be executed safely: {error}")
     return answer_from_data(question, tool, sql, data)
 
 
@@ -102,6 +115,7 @@ def check_load_tool(question: str) -> dict[str, Any]:
 def get_priority_tool(question: str) -> dict[str, Any]:
     """Answer priority and due-soon questions with deterministic filtering."""
     q = question.lower()
+    # Detect explicit P2 wording such as "P2", "priority 2", or "priority two".
     max_priority = 2 if re.search(r"\b(?:p2|priority\s*2|priority\s*two)\b", q) else 1
     # ponytail: seed brief expects critical orders due by tomorrow; widen if planners need full-week P1s.
     due_limit = 7 if max_priority == 2 else 1
@@ -115,7 +129,9 @@ def get_priority_tool(question: str) -> dict[str, Any]:
 
 def simulate_downtime_tool(question: str) -> dict[str, Any]:
     """Parse one machine and downtime duration, then run deterministic simulation."""
+    # Extract a machine ID token such as M2.
     machine_match = re.search(r"\bM\d+\b", question, flags=re.IGNORECASE)
+    # Extract a duration phrase such as "4 hours" or "4 extra hrs".
     hours_match = re.search(
         r"(\d+(?:\.\d+)?)\s*(?:extra\s+|additional\s+|more\s+)?(?:hours?|hrs?|hr|h)\b",
         question.lower(),
@@ -165,6 +181,16 @@ def recommend_tool(question: str) -> dict[str, Any]:
     return answer_from_data(question, "recommend", None, data, confidence=0.8)
 
 
+def work_order_risk_tool(question: str) -> dict[str, Any]:
+    """Answer direct work-order risk questions from the seeded risk view."""
+    wo_id = extract_work_order_id(question)
+    if wo_id is None:
+        return run_sql_tool(question)
+
+    data = db.get_at_risk_order(wo_id)
+    return answer_from_data(question, "run_sql", db.AT_RISK_ORDER_SQL.strip(), data)
+
+
 def answer_from_data(
     question: str,
     tool: str,
@@ -208,9 +234,28 @@ def llm_unavailable_response(question: str, tool: str) -> dict[str, Any]:
         "sql_used": None,
         "data": [],
         "answer": "The local LLM is unavailable, so I could not generate SQL for that question.",
-        "explanation": "Check that Ollama is running and that qwen2.5:3b has been pulled.",
+        "explanation": "Check that Ollama is running and that the configured model has been pulled.",
         "confidence": 0.1,
         "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
+    }
+
+
+def sql_error_response(
+    question: str,
+    tool: str,
+    sql: str | None = None,
+    explanation: str = "The generated SQL response was not valid.",
+) -> dict[str, Any]:
+    """Return the standard response when generated SQL is malformed or unsafe."""
+    return {
+        "question": question,
+        "tool_used": tool,
+        "sql_used": sql,
+        "data": [],
+        "answer": "I could not generate a safe read-only query for that question.",
+        "explanation": explanation,
+        "confidence": 0.2,
+        "follow_ups": ["Which work orders are delayed?", "Show high-priority orders due this week."],
     }
 
 
@@ -275,8 +320,25 @@ def is_planning_question(question: str) -> bool:
     """Return whether the question is about the scheduling domain."""
     q = question.lower()
     return any(term in q for term in SCHEDULING_TERMS) or bool(
+        # Accept scheduling IDs such as WO-1003 or M4 even without other keywords.
         re.search(r"\b(?:wo-\d+|m\d+)\b", q)
     )
+
+
+def extract_work_order_id(question: str) -> str | None:
+    """Return a work-order ID token such as WO-1003, if present."""
+    # Extract direct scheduling IDs like WO-1003 from a user question.
+    match = re.search(r"\bWO-\d+\b", question, flags=re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
+def is_work_order_risk_question(question: str) -> bool:
+    """Return whether a question asks why one work order is at risk."""
+    q = question.lower()
+    return extract_work_order_id(question) is not None and any(
+        term in q for term in ("risk", "why", "blocked")
+    )
+
 
 # some common words
 def route_tool(question: str) -> str:
@@ -293,34 +355,41 @@ def route_tool(question: str) -> str:
     return "run_sql"
 
 
-def extract_work_order_id(question: str) -> str | None:
-    """Return the first work-order ID in a question."""
-    match = re.search(r"\bWO-\d+\b", question, flags=re.IGNORECASE)
-    return match.group(0).upper() if match else None
-
-
 def generate_sql(question: str) -> tuple[str, tuple[Any, ...]]:
-    """Ask Qwen for a SELECT query and bind known user values."""
+    """Ask Qwen for a structured SELECT query and parameters."""
     content = ollama_chat(
         [
-            {"role": "system", "content": sql_prompt()},
+            {
+                "role": "system",
+                "content": (
+                    f"{sql_prompt()}\n"
+                    "Return JSON only. Put the PostgreSQL SELECT statement in query. "
+                    "Use %s placeholders for user-supplied values and put the matching "
+                    "values in params, in order."
+                ),
+            },
             {"role": "user", "content": question},
-        ]
+        ],
+        model=LLM_SQL_MODEL,
+        format_schema=SQLResponse.model_json_schema(),
+        options={"temperature": 0},
     )
-    sql = re.sub(r"^```(?:sql)?|```$", "", content.strip(), flags=re.IGNORECASE).strip()
+    generated = SQLResponse.model_validate_json(content)
+    sql = generated.query.strip()
     sql = sql.rstrip(";")
-    work_order_id = extract_work_order_id(question)
-    if work_order_id is None:
-        return sql, ()
-    if "%s" in sql:
-        return sql, (work_order_id,)
-    if "$1" in sql:
-        return sql.replace("$1", "%s"), (work_order_id,)
+    params = tuple(generated.params)
+    validate_generated_sql(sql, params)
+    return sql, params
 
-    literal = re.compile(rf"(['\"]){re.escape(work_order_id)}\1", flags=re.IGNORECASE)
-    if literal.search(sql):
-        return literal.sub("%s", sql), (work_order_id,)
-    return sql, ()
+
+def validate_generated_sql(sql: str, params: tuple[Any, ...]) -> None:
+    """Validate placeholder usage before SQL reaches psycopg."""
+    if "$1" in sql:
+        raise ValueError("Use %s placeholders, not $1 placeholders.")
+    if "'%s'" in sql or '"%s"' in sql:
+        raise ValueError("Do not quote %s placeholders.")
+    if sql.count("%s") != len(params):
+        raise ValueError("SQL placeholder count does not match params count.")
 
 
 @lru_cache(maxsize=None)
@@ -368,9 +437,9 @@ Rules:
 {yaml.safe_dump(sql_config["rules"], sort_keys=False)}
 """
 
-
+# Uses LLM
 def explain_result(question: str, data: list[dict[str, Any]]) -> str:
-    """Ask Qwen to explain returned rows, with a deterministic fallback."""
+    """Ask the explanation model to explain returned rows, with a deterministic fallback."""
     config = explanation_config()
     if not data:
         return config["fallback"]["empty_result"]
@@ -387,9 +456,9 @@ def explain_result(question: str, data: list[dict[str, Any]]) -> str:
 
     Rules:
     {rules}
-"""
+    """
     try:
-        return ollama_chat([{"role": "user", "content": prompt}], timeout=5)
+        return ollama_chat([{"role": "user", "content": prompt}], timeout=5, model=LLM_EXPLANATION_MODEL)
     except httpx.HTTPError:
         return fallback_explanation(data)
 
@@ -420,11 +489,23 @@ def fallback_explanation(data: list[dict[str, Any]]) -> str:
     return f"Found {len(data)} matching scheduling records."
 
 
-def ollama_chat(messages: list[dict[str, str]], timeout: int = 30) -> str:
+def ollama_chat(
+    messages: list[dict[str, str]],
+    timeout: int = 30,
+    model: str | None = None,
+    format_schema: dict[str, Any] | None = None,
+    options: dict[str, Any] | None = None,
+) -> str:
     """Call Ollama's chat API."""
+    payload: dict[str, Any] = {"model": model or LLM_SQL_MODEL, "messages": messages, "stream": False}
+    if format_schema is not None:
+        payload["format"] = format_schema
+    if options is not None:
+        payload["options"] = options
+
     response = httpx.post(
         f"{OLLAMA_BASE_URL}/api/chat",
-        json={"model": LLM_MODEL, "messages": messages, "stream": False},
+        json=payload,
         timeout=timeout,
     )
     response.raise_for_status()
