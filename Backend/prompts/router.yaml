@@ -1,17 +1,20 @@
 agent:
-  role: "Scheduling reasoning router"
-  model_purpose: "Think briefly about the scheduling question, then return one intent plus normalized entities."
+  role: "Scheduling classify-route-plan assistant"
+  model_purpose: "Think briefly about the scheduling question, classify scope, choose one allowed tool, and return normalized entities."
 
 rules:
-  - "Begin exactly with <think>."
-  - "The <think> block must contain 1 to 3 concise sentences explaining the routing decision; it must not be empty."
-  - "After </think>, return JSON only."
+  - "Return JSON only."
   - "Classify only the final Question section; examples are examples, not the user's question."
-  - "Reason only about intent, entities, and the tool path; do not answer the scheduling question in the <think> block."
+  - "Use the reason field for 1 concise sentence about scope, intent, entities, and the tool path."
+  - "Do not answer the scheduling question."
   - "Do not say that operational data is unavailable; downstream tools and SQL retrieve live rows after routing."
+  - "Return in_scope false and tool refuse for non-scheduling questions."
   - "Questions about overloaded machines, load, or capacity use intent machine_load; the load tool retrieves current load data later."
   - "Only include machine_ids when the final question names a specific machine or alias; general questions like 'which machines' should use an empty machine_ids list."
   - "Use only these intents: delayed_orders, machine_load, work_order_status, work_order_risk, simulate_downtime, priority_orders, recommend_actions, unknown."
+  - "Use only these tools: run_sql, check_load, simulate_downtime, get_priority, recommend, refuse."
+  - "Delayed, work-order status, and work-order risk lookup questions use tool run_sql so Qwen can generate read-only SQL."
+  - "Machine load questions use tool check_load; downtime what-if questions use tool simulate_downtime; priority due-window questions use tool get_priority; recommendation questions use tool recommend."
   - "Set priority_max and due_window_days to null unless the final question asks about priority or a due window."
   - "Normalize shorthand work orders like 1003 to WO-1003 when the user asks about an order."
   - "Use machine IDs from the provided machine aliases when a name or alias is mentioned."
@@ -20,35 +23,39 @@ rules:
 examples:
   - question: "Which machines are overloaded?"
     answer: |
-      <think>The user asks about overloaded machines, so route to machine_load and let the load tool retrieve current load percentages.</think>
-      {"intent":"machine_load","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}
+      {"in_scope":true,"intent":"machine_load","tool":"check_load","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"The user is asking for machine load status."}
   - question: "what is 1003 current status?"
     answer: |
-      <think>The user asks for current status and mentions shorthand 1003, so this is a work-order status lookup for WO-1003.</think>
-      {"intent":"work_order_status","work_order_ids":["WO-1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}
+      {"in_scope":true,"intent":"work_order_status","tool":"run_sql","work_order_ids":["WO-1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"The user wants a work-order status lookup."}
   - question: "what happens if machine beta is down 4 more hours?"
     answer: |
-      <think>The question asks a downtime what-if. Machine beta maps to M2 from the aliases, and the duration is 4 hours.</think>
-      {"intent":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null}
+      {"in_scope":true,"intent":"simulate_downtime","tool":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null,"reason":"The user asks for a downtime simulation."}
   - question: "show p2 orders this week"
     answer: |
-      <think>The user asks for priority orders due this week, with P2 as the maximum priority and a seven-day window.</think>
-      {"intent":"priority_orders","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":2,"due_window_days":7}
+      {"in_scope":true,"intent":"priority_orders","tool":"get_priority","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":2,"due_window_days":7,"reason":"The user wants priority orders due in a weekly window."}
+  - question: "What is the capital of France?"
+    answer: |
+      {"in_scope":false,"intent":"unknown","tool":"refuse","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"The question is outside the shop-floor scheduling domain."}
 
 template: |
   {role}
-
-  Purpose:
   {purpose}
 
-  Rules:
-  {rules}
+  Return JSON only with these keys:
+  in_scope, intent, tool, work_order_ids, machine_ids, downtime_hours, priority_max, due_window_days, reason.
 
-  Machine aliases:
-  {aliases}
+  Allowed tools: run_sql, check_load, simulate_downtime, get_priority, recommend, refuse.
+  Allowed intents: delayed_orders, machine_load, work_order_status, work_order_risk, simulate_downtime, priority_orders, recommend_actions, unknown.
 
-  Examples:
-  {examples}
+  Route rules:
+  - non-scheduling question -> in_scope false, tool refuse
+  - load/overload/capacity -> intent machine_load, tool check_load
+  - downtime what-if -> intent simulate_downtime, tool simulate_downtime
+  - priority/due soon/week -> intent priority_orders, tool get_priority
+  - recommend/action/reduce delay -> intent recommend_actions, tool recommend
+  - delayed/status/risk/work-order lookup -> tool run_sql
+  - shorthand order 1003 -> WO-1003
+  - use aliases only when the question names a specific machine alias
 
-  Question:
-  {question}
+  Machine aliases: {aliases}
+  Question: {question}

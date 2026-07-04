@@ -599,8 +599,8 @@
         ["Building answer", 74],
         ["Judging confidence", 90]
       ];
-      const averageResponseMs = 26800;
-      const stageIntervalMs = Math.round(averageResponseMs / (stages.length - 1));
+      const measuredAverageResponseMs = 12;
+      const stageIntervalMs = Math.max(Math.round(measuredAverageResponseMs / (stages.length - 1)), 300);
       let index = 0;
       bubble.innerHTML = `
         <div class="message-title">Planning Copilot</div>

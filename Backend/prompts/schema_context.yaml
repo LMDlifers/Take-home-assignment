@@ -83,7 +83,7 @@ schema:
 
 known_values:
   machines:
-    machine_id: ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"]
+    machine_id: ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"] # manually implemented
     current_status: ["available", "partial", "unavailable"]
     machine_type: ["CNC Mill", "Press", "Laser", "Mill", "Welding", "Grinder"]
     location: ["Bay A", "Bay B", "Bay C", "Bay D"]
@@ -96,13 +96,26 @@ known_values:
       "3": "Medium"
       "4": "Low"
       "5": "Backlog"
-    product_code: ["PART-A", "PART-B", "PART-C", "PART-D", "PART-E", "PART-F", "PART-G", "PART-H", "PART-I", "PART-J"]
+    product_code:
+      [
+        "PART-A",
+        "PART-B",
+        "PART-C",
+        "PART-D",
+        "PART-E",
+        "PART-F",
+        "PART-G",
+        "PART-H",
+        "PART-I",
+        "PART-J",
+      ]
 
   downtime_schedule:
     downtime_type: ["planned", "unplanned", "calibration"]
 
   products:
-    product_family: ["Drive Train", "Engine", "Fluid Systems", "Automation", "Frame"]
+    product_family:
+      ["Drive Train", "Engine", "Fluid Systems", "Automation", "Frame"]
 
 business_rules:
   load_status:

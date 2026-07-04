@@ -5,6 +5,7 @@ reasoning, routes to the right tool, and logs each action for auditability.
 """
 
 import json
+import math
 import re
 import uuid
 from decimal import Decimal
@@ -30,8 +31,14 @@ OLLAMA_BASE_URL = settings.ollama_base_url
 LLM_ROUTER_MODEL = settings.llm_router_model
 LLM_SQL_MODEL = settings.llm_sql_model
 LLM_JUDGE_MODEL = settings.llm_judge_model
+LLM_ANSWER_MODEL = settings.llm_answer_model
+LLM_EXPLANATION_MODEL = settings.llm_explanation_model
+LLM_FOLLOWUP_MODEL = settings.llm_followup_model
 ROUTER_FALLBACK_REASONING = "DeepSeek router reasoning was unavailable; deterministic parsing routed this request."
 JUDGE_FALLBACK_REASON = "Judge unavailable; kept deterministic fallback confidence."
+EMCS_ENTROPY_WEIGHT = settings.emcs_entropy_weight
+ALLOWED_TOOLS = {"run_sql", "check_load", "simulate_downtime", "get_priority", "recommend", "refuse", "count_orders"}
+DEFAULT_FOLLOW_UPS = ["Which machines are causing the most delays?", "Show high-priority orders due this week."]
 
 
 class SQLResponse(BaseModel):
@@ -54,6 +61,9 @@ class ExtractedQuestion(BaseModel):
     downtime_hours: float | None = None
     priority_max: int | None = None
     due_window_days: int | None = None
+    in_scope: bool = True
+    tool: str | None = None
+    reason: str | None = None
 
 
 class RouterResult(BaseModel):
@@ -69,10 +79,19 @@ class ConfidenceJudgeResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    value_estimate: float = Field(ge=0.0, le=1.0)
     confidence_score: float = Field(ge=0.0, le=1.0)
     verdict: Literal["supported", "partially_supported", "unsupported", "not_applicable"]
     reason: str
     issues: list[str] = Field(default_factory=list)
+
+
+class FollowUpResponse(BaseModel):
+    """Structured planner follow-up suggestions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    follow_ups: list[str] = Field(default_factory=list, max_length=3)
 
 
 SCHEDULING_TERMS = {
@@ -104,7 +123,7 @@ INTENT_TO_TOOL = {
     "work_order_count": "count_orders",
     "work_order_risk": "run_sql",
     "work_order_status": "run_sql",
-    "delayed_orders": "delayed_orders",
+    "delayed_orders": "run_sql",
 }
 
 
@@ -113,29 +132,26 @@ def answer_question(question: str) -> dict[str, Any]:
     session_id = str(uuid.uuid4()) # for recording into agent_action_log database
     trace: list[dict[str, Any]] = []
 
-    in_scope = is_planning_question(question)
-    trace.append({"step": "scope_check", "in_scope": in_scope})
-    if not in_scope:
+    routed = extract_question(question)
+    extracted = routed.extracted
+    trace.append(
+        {
+            "step": "planner",
+            "result": extracted.model_dump(),
+            "reasoning": routed.reasoning,
+            "model": routed.used_model,
+        }
+    )
+    if not extracted.in_scope or route_extracted(question, extracted) == "refuse":
         response = refuse_response(question)
         skip_confidence_judge(trace, "Out-of-scope refusal is deterministic.")
         attach_trace(response, trace)
         safe_log_action(session_id, response)
         return response
 
-    routed = extract_question(question)
-    extracted = routed.extracted
-    trace.append(
-        {
-            "step": "extract",
-            "result": extracted.model_dump(),
-            "reasoning": routed.reasoning,
-            "model": routed.used_model,
-        }
-    )
     validation_response = validate_entities(question, extracted)
     if validation_response is not None:
         trace.append({"step": "entity_validation", "status": "failed", "message": validation_response["answer"]})
-        validation_response["explanation"] = routed.reasoning
         skip_confidence_judge(trace, "Entity validation failure is deterministic.")
         attach_trace(validation_response, trace)
         safe_log_action(session_id, validation_response)
@@ -154,16 +170,9 @@ def answer_question(question: str) -> dict[str, Any]:
         response = recommend_tool(question)
     elif tool == "count_orders":
         response = count_orders_tool(question, extracted)
-    elif tool == "delayed_orders":
-        response = delayed_orders_tool(question)
-    elif extracted.intent == "work_order_status":
-        response = work_order_status_tool(question, extracted)
-    elif extracted.intent == "work_order_risk" or is_work_order_risk_question(question):
-        response = work_order_risk_tool(question, extracted)
     else:
         response = run_sql_tool(question, tool)
 
-    response["explanation"] = routed.reasoning
     apply_confidence_judge(response, trace)
     attach_trace(response, trace)
     safe_log_action(session_id, response)
@@ -187,7 +196,7 @@ def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
         data = db.fetch_all(sql, params)
     except (ValueError, psycopg.Error) as error:
         return sql_error_response(question, tool, sql, f"The generated query could not be executed safely: {error}")
-    return answer_from_data(question, tool, sql, data)
+    return answer_from_data(question, tool, sql, data, confidence_source="llm")
 
 
 def check_load_tool(question: str) -> dict[str, Any]:
@@ -245,6 +254,7 @@ def simulate_downtime_tool(question: str, extracted: ExtractedQuestion | None = 
             "answer": "Please include a machine ID and downtime hours, for example: M2 down for 4 hours.",
             "explanation": "Downtime simulation needs one machine and one duration.",
             "confidence": 0.4,
+            "_confidence_source": "fallback",
             "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
         }
 
@@ -258,6 +268,7 @@ def simulate_downtime_tool(question: str, extracted: ExtractedQuestion | None = 
             "answer": f"I could not find machine {machine_id}.",
             "explanation": "Use a machine ID from the seeded machine list, such as M1 or M2.",
             "confidence": 0.4,
+            "_confidence_source": "fallback",
             "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
         }
 
@@ -291,7 +302,7 @@ ORDER BY wo_id ASC
         data = db.fetch_all(sql)
     except (ValueError, psycopg.Error) as error:
         return sql_error_response(question, "run_sql", sql.strip(), f"The fixed delayed-orders query failed safely: {error}")
-    return answer_from_data(question, "run_sql", sql.strip(), data)
+    return answer_from_data(question, "run_sql", sql.strip(), data, confidence_source="fixed_sql")
 
 
 def count_orders_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
@@ -301,7 +312,7 @@ def count_orders_tool(question: str, extracted: ExtractedQuestion) -> dict[str, 
         return run_sql_tool(question)
     sql = "SELECT status, COUNT(*)::int AS count FROM work_orders WHERE status = %s GROUP BY status"
     data = db.fetch_all(sql, (status,)) or [{"status": status, "count": 0}]
-    return answer_from_data(question, "run_sql", sql, data)
+    return answer_from_data(question, "run_sql", sql, data, confidence_source="fixed_sql")
 
 
 def work_order_status_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
@@ -310,7 +321,7 @@ def work_order_status_tool(question: str, extracted: ExtractedQuestion) -> dict[
     if wo_id is None:
         return run_sql_tool(question)
     data = db.get_work_order_status(wo_id)
-    return answer_from_data(question, "run_sql", db.WORK_ORDER_STATUS_SQL.strip(), data)
+    return answer_from_data(question, "run_sql", db.WORK_ORDER_STATUS_SQL.strip(), data, confidence_source="fixed_sql")
 
 
 def work_order_risk_tool(question: str, extracted: ExtractedQuestion | None = None) -> dict[str, Any]:
@@ -320,7 +331,7 @@ def work_order_risk_tool(question: str, extracted: ExtractedQuestion | None = No
         return run_sql_tool(question)
 
     data = db.get_at_risk_order(wo_id)
-    return answer_from_data(question, "run_sql", db.AT_RISK_ORDER_SQL.strip(), data)
+    return answer_from_data(question, "run_sql", db.AT_RISK_ORDER_SQL.strip(), data, confidence_source="fixed_sql")
 
 
 def answer_from_data(
@@ -329,18 +340,54 @@ def answer_from_data(
     sql: str | None,
     data: list[dict[str, Any]],
     confidence: float = 0.75,
+    confidence_source: str = "deterministic",
 ) -> dict[str, Any]:
     """Build the common /ask response from retrieved or computed data."""
-    answer = deterministic_answer(question, tool, data) or fallback_answer(data)
+    draft = deterministic_answer(question, tool, data) or fallback_answer(data)
+    answer = draft
+    answer_generation = {
+        "source": "fallback",
+        "model": LLM_ANSWER_MODEL,
+        "draft": draft,
+    }
+    try:
+        answer = freestyle_answer(question, tool, sql, data, draft)
+        answer_generation["source"] = "llm"
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        answer_generation["reason"] = "Answer model unavailable; kept deterministic draft."
+    explanation = draft
+    explanation_generation = {
+        "source": "fallback",
+        "model": LLM_EXPLANATION_MODEL,
+    }
+    try:
+        explanation = explain_result(question, tool, sql, data, draft, answer)
+        explanation_generation["source"] = "llm"
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        explanation_generation["reason"] = "Explanation model unavailable; kept deterministic draft."
+    follow_ups = DEFAULT_FOLLOW_UPS
+    followup_generation = {
+        "source": "fallback",
+        "model": LLM_FOLLOWUP_MODEL,
+    }
+    try:
+        follow_ups = generate_follow_ups(question, tool, data, answer, explanation)
+        followup_generation["source"] = "llm"
+    except (httpx.HTTPError, ValueError, ValidationError, KeyError, TypeError):
+        followup_generation["reason"] = "Follow-up model unavailable; kept default suggestions."
     return {
         "question": question,
         "tool_used": tool,
         "sql_used": sql,
         "data": data,
         "answer": answer,
-        "explanation": ROUTER_FALLBACK_REASONING,
+        "explanation": explanation,
         "confidence": confidence,
-        "follow_ups": ["Which machines are causing the most delays?", "Show high-priority orders due this week."],
+        "_confidence_source": confidence_source,
+        "_answer_generation": answer_generation,
+        "_explanation_generation": explanation_generation,
+        "_followup_generation": followup_generation,
+        "follow_ups": follow_ups,
     }
 
 
@@ -357,8 +404,20 @@ def attach_trace(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
             {
                 "step": "answer_generation",
                 "answer": response.get("answer"),
+                **response.pop("_answer_generation", {"source": "deterministic"}),
+                "note": "Answer is LLM-written from retrieved evidence when available.",
+            },
+            {
+                "step": "explanation_generation",
                 "explanation": response.get("explanation"),
-                "note": "Answer is built from retrieved data; explanation is parsed from the DeepSeek router <think> block when available.",
+                **response.pop("_explanation_generation", {"source": "deterministic"}),
+                "note": "Explanation is LLM-written from retrieved evidence when available.",
+            },
+            {
+                "step": "followup_generation",
+                "follow_ups": response.get("follow_ups"),
+                **response.pop("_followup_generation", {"source": "deterministic"}),
+                "note": "Follow-ups are LLM-written from the response context when available.",
             },
             {"step": "audit_log", "status": "best_effort"},
         ]
@@ -372,7 +431,38 @@ def skip_confidence_judge(trace: list[dict[str, Any]], reason: str) -> None:
 
 
 def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
-    """Replace fallback confidence with an evidence-support score when possible."""
+    """Calibrate response confidence with deterministic or LLM EMCS."""
+    source = response.pop("_confidence_source", "deterministic")
+    if source in {"deterministic", "fixed_sql"}:
+        value_estimate = 0.92 if source == "fixed_sql" else 0.95
+        confidence_score = 0.95
+        calibration = emcs_calibration(value_estimate, confidence_score)
+        response["confidence"] = calibration["emcs_score"]
+        trace.append(
+            {
+                "step": "confidence_judge",
+                "status": "ok",
+                "source": "deterministic",
+                **calibration,
+                "verdict": "supported",
+                "reason": "Deterministic evidence path; EMCS calibrated without calling the judge model.",
+                "issues": [],
+            }
+        )
+        return
+
+    if source == "fallback":
+        trace.append(
+            {
+                "step": "confidence_judge",
+                "status": "fallback",
+                "source": "fallback",
+                "reason": "Fallback response kept its existing confidence.",
+                "score": response.get("confidence"),
+            }
+        )
+        return
+
     try:
         judged = judge_confidence(response)
     except (httpx.HTTPError, ValueError, ValidationError, KeyError, TypeError):
@@ -380,6 +470,7 @@ def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]
             {
                 "step": "confidence_judge",
                 "status": "fallback",
+                "source": "fallback",
                 "model": LLM_JUDGE_MODEL,
                 "reason": JUDGE_FALLBACK_REASON,
                 "score": response.get("confidence"),
@@ -387,18 +478,59 @@ def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]
         )
         return
 
-    response["confidence"] = judged.confidence_score
+    calibration = emcs_calibration(judged.value_estimate, judged.confidence_score)
+    response["confidence"] = calibration["emcs_score"]
     trace.append(
         {
             "step": "confidence_judge",
             "status": "ok",
+            "source": "llm",
             "model": LLM_JUDGE_MODEL,
-            "score": judged.confidence_score,
+            **calibration,
             "verdict": judged.verdict,
             "reason": judged.reason,
             "issues": judged.issues,
         }
     )
+
+
+def clamp_unit(value: float) -> float:
+    """Clamp a score into the public 0..1 range."""
+    return min(max(float(value), 0.0), 1.0)
+
+
+def clamp_probability(value: float) -> float:
+    """Clamp probability away from exact edges for entropy math."""
+    return min(max(float(value), 1e-9), 1 - 1e-9)
+
+
+def bernoulli_entropy(confidence_score: float) -> float:
+    """Return Bernoulli entropy for evaluator confidence."""
+    confidence = clamp_probability(confidence_score)
+    return -(confidence * math.log(confidence) + (1 - confidence) * math.log(1 - confidence))
+
+
+def emcs_calibration(
+    value_estimate: float,
+    confidence_score: float,
+    entropy_weight: float = EMCS_ENTROPY_WEIGHT,
+) -> dict[str, float]:
+    """Return EMCS-calibrated confidence fields."""
+    value = clamp_unit(value_estimate)
+    confidence = clamp_unit(confidence_score)
+    entropy = bernoulli_entropy(confidence)
+    entropy_norm = entropy / math.log(2)
+    emcs_score = value * (1 - entropy_weight * entropy_norm)
+    emcs_score = clamp_unit(emcs_score)
+    return {
+        "value_estimate": round(value, 4),
+        "confidence_score": round(confidence, 4),
+        "entropy": round(entropy, 4),
+        "entropy_norm": round(entropy_norm, 4),
+        "entropy_weight": round(entropy_weight, 4),
+        "emcs_score": round(emcs_score, 4),
+        "score": round(emcs_score, 4),
+    }
 
 
 def judge_confidence(response: dict[str, Any]) -> ConfidenceJudgeResponse:
@@ -407,7 +539,7 @@ def judge_confidence(response: dict[str, Any]) -> ConfidenceJudgeResponse:
         [{"role": "user", "content": judge_prompt(response)}],
         model=LLM_JUDGE_MODEL,
         format_schema=ConfidenceJudgeResponse.model_json_schema(),
-        options={"temperature": 0},
+        options={"temperature": 0, "num_predict": 200},
         timeout=settings.llm_judge_timeout_seconds,
     )
     return ConfidenceJudgeResponse.model_validate_json(content)
@@ -544,6 +676,7 @@ def llm_unavailable_response(question: str, tool: str) -> dict[str, Any]:
         "answer": "The local LLM is unavailable, so I could not generate SQL for that question.",
         "explanation": "Check that Ollama is running and that the configured model has been pulled.",
         "confidence": 0.1,
+        "_confidence_source": "fallback",
         "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
     }
 
@@ -563,6 +696,7 @@ def sql_error_response(
         "answer": "I could not generate a safe read-only query for that question.",
         "explanation": explanation,
         "confidence": 0.2,
+        "_confidence_source": "fallback",
         "follow_ups": ["Which work orders are delayed?", "Show high-priority orders due this week."],
     }
 
@@ -666,16 +800,14 @@ def is_work_order_risk_question(question: str) -> bool:
 
 
 def extract_question(question: str) -> RouterResult:
-    """Extract intent/entities with deterministic rules, then DeepSeek router reasoning."""
-    extracted = deterministic_extract_question(question)
-    if extraction_is_complete(extracted):
-        return RouterResult(extracted=extracted)
+    """Plan with DeepSeek first, using deterministic parsing for trusted facts."""
+    deterministic = deterministic_extract_question(question)
     try:
         routed = route_question_with_slm(question)
     except (httpx.HTTPError, ValueError, ValidationError):
-        return RouterResult(extracted=extracted)
+        return RouterResult(extracted=deterministic)
     return RouterResult(
-        extracted=merge_extractions(extracted, routed.extracted),
+        extracted=merge_extractions(deterministic, routed.extracted),
         reasoning=routed.reasoning,
         used_model=routed.used_model,
     )
@@ -724,6 +856,7 @@ def deterministic_extract_question(question: str) -> ExtractedQuestion:
         downtime_hours=float(hours_match.group(1)) if hours_match else None,
         priority_max=priority_max,
         due_window_days=7 if "week" in q else None,
+        in_scope=is_planning_question(question),
     )
 
 
@@ -738,7 +871,7 @@ def extraction_is_complete(extracted: ExtractedQuestion) -> bool:
 
 def merge_extractions(primary: ExtractedQuestion, secondary: ExtractedQuestion) -> ExtractedQuestion:
     """Prefer deterministic facts, filling gaps from SLM output."""
-    intent = primary.intent if primary.intent != "unknown" else secondary.intent
+    intent = secondary.intent if secondary.intent != "unknown" else primary.intent
     machine_ids = primary.machine_ids
     if not machine_ids and intent == "simulate_downtime":
         machine_ids = secondary.machine_ids
@@ -749,6 +882,9 @@ def merge_extractions(primary: ExtractedQuestion, secondary: ExtractedQuestion) 
         downtime_hours=primary.downtime_hours if primary.downtime_hours is not None else secondary.downtime_hours,
         priority_max=primary.priority_max if primary.priority_max is not None else secondary.priority_max,
         due_window_days=primary.due_window_days if primary.due_window_days is not None else secondary.due_window_days,
+        in_scope=secondary.in_scope if secondary.in_scope is not None else primary.in_scope,
+        tool=secondary.tool or primary.tool,
+        reason=secondary.reason or primary.reason,
     )
 
 
@@ -758,9 +894,8 @@ def route_question_with_slm(question: str) -> RouterResult:
     content = ollama_chat(
         [{"role": "user", "content": prompt}],
         model=LLM_ROUTER_MODEL,
-        options={"temperature": 0},
+        options={"temperature": 0, "num_predict": 160},
         timeout=settings.llm_router_timeout_seconds,
-        include_thinking=True,
     )
     return parse_router_response(content)
 
@@ -776,7 +911,7 @@ def parse_router_response(content: str) -> RouterResult:
     extracted = ExtractedQuestion.model_validate_json(payload_match.group(0))
     return RouterResult(
         extracted=normalize_extracted(extracted),
-        reasoning=reasoning or ROUTER_FALLBACK_REASONING,
+        reasoning=reasoning or extracted.reason or ROUTER_FALLBACK_REASONING,
         used_model=LLM_ROUTER_MODEL,
     )
 
@@ -802,6 +937,9 @@ def normalize_extracted(extracted: ExtractedQuestion) -> ExtractedQuestion:
         downtime_hours=extracted.downtime_hours,
         priority_max=extracted.priority_max,
         due_window_days=extracted.due_window_days,
+        in_scope=extracted.in_scope,
+        tool=extracted.tool if extracted.tool in ALLOWED_TOOLS else None,
+        reason=extracted.reason,
     )
 
 
@@ -848,6 +986,8 @@ def entity_not_found_response(question: str, message: str) -> dict[str, Any]:
 
 def route_extracted(question: str, extracted: ExtractedQuestion) -> str:
     """Route from structured extraction, falling back to keyword routing."""
+    if extracted.tool in ALLOWED_TOOLS:
+        return extracted.tool
     return INTENT_TO_TOOL.get(extracted.intent) or route_tool(question)
 
 
@@ -878,7 +1018,7 @@ def generate_sql(question: str) -> tuple[str, tuple[Any, ...]]:
         ],
         model=LLM_SQL_MODEL,
         format_schema=SQLResponse.model_json_schema(),
-        options={"temperature": 0},
+        options={"temperature": 0, "num_predict": 200},
         timeout=settings.llm_sql_timeout_seconds,
     )
     generated = SQLResponse.model_validate_json(content)
@@ -925,6 +1065,21 @@ def router_config() -> dict[str, Any]:
 def judge_config() -> dict[str, Any]:
     """Return Qwen confidence judge role and rules."""
     return load_prompt("judge.yaml")
+
+
+def answer_config() -> dict[str, Any]:
+    """Return Qwen grounded answer-writing role and rules."""
+    return load_prompt("answer.yaml")
+
+
+def explanation_config() -> dict[str, Any]:
+    """Return Qwen grounded explanation-writing role and rules."""
+    return load_prompt("explanation.yaml")
+
+
+def followup_config() -> dict[str, Any]:
+    """Return Qwen follow-up suggestion role and rules."""
+    return load_prompt("followups.yaml")
 
 
 def router_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
@@ -980,9 +1135,135 @@ def judge_prompt(response: dict[str, Any]) -> str:
         role=config["agent"]["role"],
         purpose=config["agent"]["model_purpose"],
         rules=yaml.safe_dump(config["rules"], sort_keys=False),
-        rubric=yaml.safe_dump(config["rubric"], sort_keys=False),
+        value_rubric=yaml.safe_dump(config["value_rubric"], sort_keys=False),
+        confidence_rubric=yaml.safe_dump(config["confidence_rubric"], sort_keys=False),
         evidence=json.dumps(evidence, default=str, ensure_ascii=True),
     )
+
+
+def answer_prompt(question: str, tool: str, sql: str | None, data: list[dict[str, Any]], draft: str) -> str:
+    """Build the grounded freestyle answer prompt from YAML."""
+    config = answer_config()
+    evidence = {
+        "question": question,
+        "tool_used": tool,
+        "sql_used": sql,
+        "data": data,
+    }
+    return config["template"].format(
+        role=config["agent"]["role"],
+        purpose=config["agent"]["model_purpose"],
+        rules=yaml.safe_dump(config["rules"], sort_keys=False),
+        draft=draft,
+        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
+    )
+
+
+def explanation_prompt(
+    question: str,
+    tool: str,
+    sql: str | None,
+    data: list[dict[str, Any]],
+    draft: str,
+    answer: str,
+) -> str:
+    """Build the grounded planner explanation prompt from YAML."""
+    config = explanation_config()
+    context = schema_context()
+    evidence = {
+        "question": question,
+        "tool_used": tool,
+        "sql_used": sql,
+        "data": data,
+        "answer": answer,
+        "deterministic_draft": draft,
+    }
+    return config["template"].format(
+        role=config["agent"]["role"],
+        purpose=config["agent"]["model_purpose"],
+        rules=yaml.safe_dump(config["rules"], sort_keys=False),
+        business_rules=yaml.safe_dump(context["business_rules"], sort_keys=False),
+        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
+    )
+
+
+def followup_prompt(
+    question: str,
+    tool: str,
+    data: list[dict[str, Any]],
+    answer: str,
+    explanation: str,
+) -> str:
+    """Build the grounded follow-up suggestion prompt from YAML."""
+    config = followup_config()
+    evidence = {
+        "question": question,
+        "tool_used": tool,
+        "data": data,
+        "answer": answer,
+        "explanation": explanation,
+    }
+    return config["template"].format(
+        role=config["agent"]["role"],
+        purpose=config["agent"]["model_purpose"],
+        rules=yaml.safe_dump(config["rules"], sort_keys=False),
+        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
+    )
+
+
+def freestyle_answer(question: str, tool: str, sql: str | None, data: list[dict[str, Any]], draft: str) -> str:
+    """Ask Qwen to write the final answer using only returned evidence."""
+    content = ollama_chat(
+        [{"role": "user", "content": answer_prompt(question, tool, sql, data, draft)}],
+        model=LLM_ANSWER_MODEL,
+        options={"temperature": 0.4, "num_predict": 160},
+        timeout=settings.llm_answer_timeout_seconds,
+    ).strip()
+    if not content:
+        raise ValueError("Answer model returned empty content.")
+    return content
+
+
+def explain_result(
+    question: str,
+    tool: str,
+    sql: str | None,
+    data: list[dict[str, Any]],
+    draft: str,
+    answer: str,
+) -> str:
+    """Ask Qwen to explain the returned scheduling evidence in planner language."""
+    content = ollama_chat(
+        [{"role": "user", "content": explanation_prompt(question, tool, sql, data, draft, answer)}],
+        model=LLM_EXPLANATION_MODEL,
+        options={"temperature": 0.3, "num_predict": 220},
+        timeout=settings.llm_explanation_timeout_seconds,
+    ).strip()
+    if not content:
+        raise ValueError("Explanation model returned empty content.")
+    return content
+
+
+def generate_follow_ups(
+    question: str,
+    tool: str,
+    data: list[dict[str, Any]],
+    answer: str,
+    explanation: str,
+) -> list[str]:
+    """Ask Qwen for planner-relevant follow-up questions."""
+    content = ollama_chat(
+        [{"role": "user", "content": followup_prompt(question, tool, data, answer, explanation)}],
+        model=LLM_FOLLOWUP_MODEL,
+        format_schema=FollowUpResponse.model_json_schema(),
+        options={"temperature": 0.2, "num_predict": 128},
+        timeout=settings.llm_followup_timeout_seconds,
+    )
+    follow_ups = [item.strip() for item in FollowUpResponse.model_validate_json(content).follow_ups if item.strip()]
+    if not follow_ups:
+        raise ValueError("Follow-up model returned no suggestions.")
+    return follow_ups[:3]
+
 
 def fallback_answer(data: list[dict[str, Any]]) -> str:
     """Return a readable answer when a result shape has no custom template."""

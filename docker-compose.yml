@@ -41,7 +41,7 @@ services:
       ollama:
         condition: service_started
     entrypoint: ["/bin/sh", "-c"]
-    command: ["until ollama list; do sleep 2; done; ollama pull $${LLM_ROUTER_MODEL}; ollama pull $${LLM_SQL_MODEL}"]
+    command: ["until ollama list; do sleep 2; done; ollama pull $${LLM_ROUTER_MODEL}; ollama pull $${LLM_SQL_MODEL}; ollama pull $${LLM_ANSWER_MODEL}"]
 
   api:
     build:

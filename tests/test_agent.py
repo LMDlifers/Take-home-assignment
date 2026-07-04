@@ -1,10 +1,40 @@
 from datetime import date
+import re
 
 import psycopg
 import pytest
 
 from app import agent
 from app import db
+
+
+def answer_draft_from_prompt(prompt: str) -> str:
+    match = re.search(r"Draft to rewrite:\n(.*?)\n\nEvidence JSON:", prompt, flags=re.DOTALL)
+    assert match is not None
+    return match.group(1).strip()
+
+
+def fake_qwen_response(messages, **kwargs):
+    prompt = messages[0]["content"]
+    schema = kwargs.get("format_schema")
+    if schema == agent.SQLResponse.model_json_schema():
+        return '{"query":"SELECT wo_id FROM work_orders","params":[]}'
+    if schema == agent.ConfidenceJudgeResponse.model_json_schema():
+        return '{"value_estimate":0.75,"confidence_score":0.9,"verdict":"supported","reason":"The answer is supported by the returned data.","issues":[]}'
+    if schema == agent.FollowUpResponse.model_json_schema():
+        return '{"follow_ups":["Which orders should be handled first?","Which machine is the next bottleneck?"]}'
+    if "Scheduling classify-route-plan assistant" in prompt:
+        lower_prompt = prompt.lower()
+        if "question: what happens if machine beta" in lower_prompt:
+            return '{"in_scope":true,"intent":"simulate_downtime","tool":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null,"reason":"Downtime simulation."}'
+        if "question: what is the capital of france" in lower_prompt:
+            return '{"in_scope":false,"intent":"unknown","tool":"refuse","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"Outside scope."}'
+        return '{"in_scope":true,"intent":"unknown","tool":null,"work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"Scheduling question."}'
+    if "Draft to rewrite:" in prompt:
+        return answer_draft_from_prompt(prompt)
+    if "Factory planning explanation writer" in prompt:
+        return "The returned scheduling evidence supports this answer and highlights the relevant machines or work orders."
+    raise AssertionError("unexpected Qwen call")
 
 
 @pytest.fixture(autouse=True)
@@ -15,13 +45,14 @@ def no_audit_log(monkeypatch) -> None:
     monkeypatch.setattr(db, "get_machine_aliases", lambda: [])
 
     def fake_ollama_chat(messages, **kwargs):
-        if kwargs.get("model") == agent.LLM_ROUTER_MODEL:
-            prompt = messages[0]["content"].lower()
-            if "question:\nwhat happens if machine beta" in prompt:
-                return '<think>Machine beta maps to M2, and the user asks for a four-hour downtime simulation.</think>{"intent":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null}'
-            return '<think>The question is in the scheduling domain, so deterministic parsing can provide the route and entities.</think>{"intent":"unknown","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
-        if kwargs.get("model") == agent.LLM_JUDGE_MODEL:
-            return '{"confidence_score":0.75,"verdict":"supported","reason":"The answer is supported by the returned data.","issues":[]}'
+        if kwargs.get("model") in {
+            agent.LLM_SQL_MODEL,
+            agent.LLM_JUDGE_MODEL,
+            agent.LLM_ANSWER_MODEL,
+            agent.LLM_EXPLANATION_MODEL,
+            agent.LLM_FOLLOWUP_MODEL,
+        }:
+            return fake_qwen_response(messages, **kwargs)
         raise AssertionError("unexpected Ollama call")
 
     monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
@@ -101,7 +132,7 @@ def test_successful_run_sql_is_logged(monkeypatch) -> None:
     assert logs[0]["action_type"] == "query_generated"
     assert logs[0]["input_question"] == "Show all work orders"
     assert logs[0]["sql_generated"] == "SELECT wo_id FROM work_orders"
-    assert logs[0]["confidence"] == 0.75
+    assert logs[0]["confidence"] == agent.emcs_calibration(0.75, 0.9)["emcs_score"]
     assert logs[0]["result_summary"] == "Found 1 work orders: WO-1003."
 
 
@@ -116,7 +147,7 @@ def test_check_load_tool_uses_deterministic_query(monkeypatch) -> None:
     assert "v_machine_load" in response["sql_used"]
     assert [row["machine_id"] for row in response["data"]] == ["M3", "M6", "M5"]
     assert response["answer"] != response["explanation"]
-    assert "deterministic parsing" in response["explanation"]
+    assert response["explanation"].startswith("The returned scheduling evidence")
 
 
 def test_check_load_is_logged_as_query_generated(monkeypatch) -> None:
@@ -294,14 +325,21 @@ def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
     assert logs[0]["result_summary"].startswith("Generated 1 recommendations:")
 
 
-def test_work_order_risk_question_uses_deterministic_view(monkeypatch) -> None:
-    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+def test_work_order_risk_question_uses_generated_sql(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "generate_sql",
+        lambda question: (
+            "SELECT wo_id, required_machine, machine_status, risk_reason FROM v_at_risk_orders WHERE wo_id = %s",
+            ("WO-1003",),
+        ),
+    )
     monkeypatch.setattr(
         db,
-        "get_at_risk_order",
-        lambda wo_id: [
+        "fetch_all",
+        lambda sql, params=(): [
             {
-                "wo_id": wo_id,
+                "wo_id": params[0],
                 "required_machine": "M4",
                 "machine_status": "unavailable",
                 "risk_reason": "Machine M4 is unavailable",
@@ -317,14 +355,18 @@ def test_work_order_risk_question_uses_deterministic_view(monkeypatch) -> None:
     assert response["answer"] == "WO-1003 is at risk: Machine M4 is unavailable."
 
 
-def test_shorthand_work_order_status_uses_fixed_query(monkeypatch) -> None:
-    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+def test_shorthand_work_order_status_uses_generated_sql(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "generate_sql",
+        lambda question: ("SELECT wo_id, status, required_machine FROM work_orders WHERE wo_id = %s", ("WO-1003",)),
+    )
     monkeypatch.setattr(
         db,
-        "get_work_order_status",
-        lambda wo_id: [
+        "fetch_all",
+        lambda sql, params=(): [
             {
-                "wo_id": wo_id,
+                "wo_id": params[0],
                 "status": "delayed",
                 "required_machine": "M4",
                 "machine_status": "unavailable",
@@ -337,10 +379,10 @@ def test_shorthand_work_order_status_uses_fixed_query(monkeypatch) -> None:
     assert response["tool_used"] == "run_sql"
     assert response["data"][0]["wo_id"] == "WO-1003"
     assert response["answer"] == "WO-1003 is delayed, requires M4."
-    assert response["trace"][1]["step"] == "extract"
-    assert response["trace"][1]["result"]["work_order_ids"] == ["WO-1003"]
-    assert response["trace"][3]["step"] == "route"
-    assert response["trace"][3]["intent"] == "work_order_status"
+    assert response["trace"][0]["step"] == "planner"
+    assert response["trace"][0]["result"]["work_order_ids"] == ["WO-1003"]
+    assert response["trace"][2]["step"] == "route"
+    assert response["trace"][2]["intent"] == "work_order_status"
 
 
 def test_missing_work_order_fails_before_sql(monkeypatch) -> None:
@@ -351,9 +393,9 @@ def test_missing_work_order_fails_before_sql(monkeypatch) -> None:
 
     assert response["tool_used"] == "refuse"
     assert response["answer"] == "Work order WO-9999 was not found."
-    assert response["trace"][2]["status"] == "failed"
-    assert response["trace"][3]["step"] == "confidence_judge"
-    assert response["trace"][3]["status"] == "skipped"
+    assert response["trace"][1]["status"] == "failed"
+    assert response["trace"][2]["step"] == "confidence_judge"
+    assert response["trace"][2]["status"] == "skipped"
 
 
 def test_slm_can_extract_machine_alias_for_downtime(monkeypatch) -> None:
@@ -384,7 +426,7 @@ def test_unsafe_generated_sql_is_rejected(monkeypatch) -> None:
     response = agent.answer_question("Show all work orders")
 
     assert response["data"] == []
-    assert response["confidence"] == 0.75
+    assert response["confidence"] == 0.2
 
 
 def test_out_of_scope_refusal_is_logged_as_clarification(monkeypatch) -> None:
@@ -431,7 +473,7 @@ def test_generate_sql_uses_structured_output(monkeypatch) -> None:
     assert params == ("WO-1003",)
     assert calls[0]["model"] == agent.LLM_SQL_MODEL
     assert calls[0]["format_schema"] == agent.SQLResponse.model_json_schema()
-    assert calls[0]["options"] == {"temperature": 0}
+    assert calls[0]["options"] == {"temperature": 0, "num_predict": 200}
 
 
 def test_route_question_uses_router_model(monkeypatch) -> None:
@@ -439,7 +481,7 @@ def test_route_question_uses_router_model(monkeypatch) -> None:
 
     def fake_ollama_chat(messages, **kwargs):
         calls.append(kwargs)
-        return '<think>1003 is shorthand for WO-1003, and the user asks for status.</think>{"intent":"work_order_status","work_order_ids":["WO-1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
+        return '{"in_scope":true,"intent":"work_order_status","tool":"run_sql","work_order_ids":["WO-1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null,"reason":"1003 is shorthand for WO-1003, and the user asks for status."}'
 
     monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
 
@@ -448,8 +490,8 @@ def test_route_question_uses_router_model(monkeypatch) -> None:
     assert routed.extracted.work_order_ids == ["WO-1003"]
     assert routed.reasoning.startswith("1003 is shorthand")
     assert calls[0]["model"] == agent.LLM_ROUTER_MODEL
-    assert calls[0]["options"] == {"temperature": 0}
-    assert calls[0]["include_thinking"] is True
+    assert "format_schema" not in calls[0]
+    assert calls[0]["options"] == {"temperature": 0, "num_predict": 160}
 
 
 def test_parse_router_response_splits_think_and_json() -> None:
@@ -561,7 +603,7 @@ def test_db_error_returns_safe_run_sql_response(monkeypatch) -> None:
     assert response["tool_used"] == "run_sql"
     assert response["sql_used"] == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
     assert response["data"] == []
-    assert response["confidence"] == 0.75
+    assert response["confidence"] == 0.2
 
 
 def test_prompt_files_load() -> None:
@@ -569,6 +611,9 @@ def test_prompt_files_load() -> None:
     assert agent.sql_generation_config()["rules"]
     assert agent.router_config()["rules"]
     assert agent.judge_config()["rules"]
+    assert agent.answer_config()["rules"]
+    assert agent.explanation_config()["rules"]
+    assert agent.followup_config()["rules"]
     assert agent.entity_extraction_config()["examples"]
 
 
@@ -591,10 +636,9 @@ def test_router_prompt_includes_aliases_and_examples() -> None:
         [{"machine_id": "M2", "machine_name": "CNC Machining Centre Beta"}],
     )
 
-    assert "Scheduling reasoning router" in prompt
-    assert "<think>" in prompt
+    assert "Scheduling classify-route-plan assistant" in prompt
+    assert "reason" in prompt
     assert "CNC Machining Centre Beta" in prompt
-    assert "WO-1003" in prompt
     assert "simulate_downtime" in prompt
 
 
@@ -603,7 +647,7 @@ def test_judge_confidence_uses_structured_output(monkeypatch) -> None:
 
     def fake_ollama_chat(messages, **kwargs):
         calls.append({"messages": messages, **kwargs})
-        return '{"confidence_score":0.92,"verdict":"supported","reason":"The answer matches the data.","issues":[]}'
+        return '{"value_estimate":0.92,"confidence_score":0.95,"verdict":"supported","reason":"The answer matches the data.","issues":[]}'
 
     monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
     judged = agent.judge_confidence(
@@ -617,17 +661,18 @@ def test_judge_confidence_uses_structured_output(monkeypatch) -> None:
         }
     )
 
-    assert judged.confidence_score == 0.92
+    assert judged.value_estimate == 0.92
+    assert judged.confidence_score == 0.95
     assert calls[0]["model"] == agent.LLM_JUDGE_MODEL
     assert calls[0]["format_schema"] == agent.ConfidenceJudgeResponse.model_json_schema()
-    assert calls[0]["options"] == {"temperature": 0}
+    assert calls[0]["options"] == {"temperature": 0, "num_predict": 200}
 
 
 def test_judge_confidence_validates_score_range(monkeypatch) -> None:
     monkeypatch.setattr(
         agent,
         "ollama_chat",
-        lambda messages, **kwargs: '{"confidence_score":1.5,"verdict":"supported","reason":"too high","issues":[]}',
+        lambda messages, **kwargs: '{"value_estimate":0.9,"confidence_score":1.5,"verdict":"supported","reason":"too high","issues":[]}',
     )
 
     with pytest.raises(agent.ValidationError):
@@ -652,6 +697,7 @@ def test_apply_confidence_judge_falls_back_on_bad_output(monkeypatch) -> None:
         "data": [],
         "answer": "None.",
         "confidence": 0.42,
+        "_confidence_source": "llm",
     }
     monkeypatch.setattr(agent, "ollama_chat", lambda messages, **kwargs: "not json")
 
@@ -671,16 +717,17 @@ def test_apply_confidence_judge_uses_low_judge_score(monkeypatch) -> None:
         "data": [{"machine_id": "M3"}],
         "answer": "M9 is overloaded.",
         "confidence": 0.75,
+        "_confidence_source": "llm",
     }
     monkeypatch.setattr(
         agent,
         "ollama_chat",
-        lambda messages, **kwargs: '{"confidence_score":0.2,"verdict":"unsupported","reason":"M9 is not in the data.","issues":["Answer names a machine absent from data."]}',
+        lambda messages, **kwargs: '{"value_estimate":0.2,"confidence_score":0.9,"verdict":"unsupported","reason":"M9 is not in the data.","issues":["Answer names a machine absent from data."]}',
     )
 
     agent.apply_confidence_judge(response, trace)
 
-    assert response["confidence"] == 0.2
+    assert response["confidence"] < 0.2
     assert trace[0]["verdict"] == "unsupported"
 
 
@@ -694,6 +741,8 @@ def test_answer_question_includes_confidence_judge_trace(monkeypatch) -> None:
     judge_steps = [step for step in response["trace"] if step["step"] == "confidence_judge"]
     assert judge_steps
     assert judge_steps[0]["status"] == "ok"
+    assert judge_steps[0]["source"] == "deterministic"
+    assert "emcs_score" in judge_steps[0]
 
 
 def test_judge_prompt_includes_answer_data_tool_and_sql() -> None:
@@ -712,3 +761,69 @@ def test_judge_prompt_includes_answer_data_tool_and_sql() -> None:
     assert "SELECT * FROM v_machine_load" in prompt
     assert "M3" in prompt
     assert "The overloaded machines are M3" in prompt
+
+
+def test_bernoulli_entropy_is_highest_near_half() -> None:
+    assert agent.bernoulli_entropy(0.5) > agent.bernoulli_entropy(0.95)
+    assert agent.bernoulli_entropy(0.5) > agent.bernoulli_entropy(0.05)
+
+
+def test_bernoulli_entropy_is_near_zero_at_edges() -> None:
+    assert agent.bernoulli_entropy(1.0) < 0.001
+    assert agent.bernoulli_entropy(0.0) < 0.001
+
+
+def test_emcs_downweights_uncertain_confidence_more() -> None:
+    certain = agent.emcs_calibration(0.9, 0.95)
+    uncertain = agent.emcs_calibration(0.9, 0.5)
+
+    assert uncertain["emcs_score"] < certain["emcs_score"]
+    assert uncertain["entropy_norm"] > certain["entropy_norm"]
+
+
+def test_deterministic_confidence_skips_llm_judge(monkeypatch) -> None:
+    calls = []
+    trace = []
+    response = {
+        "question": "Which machines are overloaded?",
+        "tool_used": "check_load",
+        "sql_used": None,
+        "data": [{"machine_id": "M3"}],
+        "answer": "M3 is overloaded.",
+        "confidence": 0.75,
+        "_confidence_source": "deterministic",
+    }
+    monkeypatch.setattr(agent, "ollama_chat", lambda messages, **kwargs: calls.append(kwargs))
+
+    agent.apply_confidence_judge(response, trace)
+
+    assert calls == []
+    assert response["confidence"] == trace[0]["emcs_score"]
+    assert trace[0]["source"] == "deterministic"
+
+
+def test_generated_sql_confidence_uses_llm_judge(monkeypatch) -> None:
+    calls = []
+    trace = []
+    response = {
+        "question": "Show all work orders",
+        "tool_used": "run_sql",
+        "sql_used": "SELECT wo_id FROM work_orders",
+        "data": [{"wo_id": "WO-1003"}],
+        "answer": "Work orders returned: WO-1003.",
+        "confidence": 0.75,
+        "_confidence_source": "llm",
+    }
+
+    def fake_ollama_chat(messages, **kwargs):
+        calls.append(kwargs)
+        return '{"value_estimate":0.9,"confidence_score":0.95,"verdict":"supported","reason":"Supported.","issues":[]}'
+
+    monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
+
+    agent.apply_confidence_judge(response, trace)
+
+    assert calls
+    assert trace[0]["source"] == "llm"
+    assert trace[0]["value_estimate"] == 0.9
+    assert trace[0]["confidence_score"] == 0.95

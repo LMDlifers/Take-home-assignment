@@ -1,6 +1,6 @@
 agent:
   role: "Evidence support judge for a shop floor scheduling assistant"
-  model_purpose: "Return a calibrated support score for whether the final answer is justified by the provided evidence."
+  model_purpose: "Return evidence support value and evaluator confidence for EMCS calibration."
 
 rules:
   - "Return JSON only."
@@ -8,16 +8,24 @@ rules:
   - "Do not reroute the request."
   - "Do not invent rows, machines, work orders, dates, or SQL."
   - "Judge only whether the answer is supported by the provided evidence."
+  - "Set value_estimate to how well the answer is supported by the evidence, from 0 to 1."
+  - "Set confidence_score to how certain you are about your value_estimate, from 0 to 1."
   - "Use not_applicable only when the response is a deterministic refusal or validation message."
   - "Keep reason to one concise sentence."
   - "Set issues to an empty list when there are no material issues."
 
-rubric:
+value_rubric:
   - "0.90 to 1.00: answer is fully supported and includes the key facts."
   - "0.70 to 0.89: answer is mostly supported with minor omissions."
   - "0.40 to 0.69: answer is partially supported, vague, or missing important context."
   - "0.10 to 0.39: answer is mostly unsupported, contradicted, or mishandles empty data."
   - "0.00: invalid or impossible to assess."
+
+confidence_rubric:
+  - "0.90 to 1.00: evidence is clear and the judgment is straightforward."
+  - "0.60 to 0.89: evidence is usable but has minor ambiguity."
+  - "0.30 to 0.59: evidence is ambiguous, sparse, or hard to compare."
+  - "0.00 to 0.29: judge cannot reliably evaluate support."
 
 template: |
   {role}
@@ -28,8 +36,11 @@ template: |
   Rules:
   {rules}
 
-  Rubric:
-  {rubric}
+  Value rubric:
+  {value_rubric}
+
+  Confidence rubric:
+  {confidence_rubric}
 
   Evidence JSON:
   {evidence}
