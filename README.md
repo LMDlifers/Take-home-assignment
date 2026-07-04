@@ -7,8 +7,7 @@ Current status: deterministic backend endpoints and the `/api/v1/ask` LLM-driven
 planner are implemented. The app can be containerised with PostgreSQL and
 Ollama, query seeded scheduling data, run deterministic scheduling tools, and
 use Qwen for classify/route/plan, read-only SQL generation, grounded answer
-writing, grounded explanation writing, follow-up suggestions, and
-answer-support confidence judging.
+writing, grounded explanation writing, and answer-support confidence judging.
 
 ## What Exists So Far
 
@@ -46,8 +45,8 @@ The router returns structured planner reasoning in the `reason` field and
 fills fuzzy entities such as `machine beta`. Qwen is used for SQL generation in the
 `run_sql` path, then rewrites the deterministic evidence-backed draft into the
 final user-facing answer, writes a planner-friendly explanation, and suggests
-follow-up questions. Qwen is also used for answer-support judging only when
-deterministic evidence is not enough.
+static follow-up questions. Qwen is also used for answer-support judging only
+when deterministic evidence is not enough.
 Each `/api/v1/ask` request writes a best-effort audit row to
 `agent_action_log`.
 
@@ -199,9 +198,8 @@ Model roles:
 
 - `qwen2.5:3b` classifies scope, routes intent, extracts fuzzy entities,
   generates structured read-only SQL, rewrites deterministic drafts into natural
-  answers, writes plain-English explanations, suggests follow-up questions using
-  only returned evidence, and, when needed, judges whether the final answer is
-  supported by the returned evidence. Qwen2.5 is instruction-tuned, strong at
+  answers, writes plain-English explanations, and, when needed, judges whether
+  the final answer is supported by the returned evidence. Qwen2.5 is instruction-tuned, strong at
   structured JSON-style outputs, and described by Qwen as pretrained on
   large-scale multilingual, code, and math data.
 - EMCS confidence calibration separates `value_estimate` from
@@ -319,8 +317,8 @@ Backend/prompts/
 ```
 
 - `.env.example` is the committed source of runtime config defaults:
-  `DATABASE_URL`, `OLLAMA_BASE_URL`, model names, LLM timeouts, and
-  `EMCS_ENTROPY_WEIGHT`.
+  `DATABASE_URL`, `OLLAMA_BASE_URL`, model names, LLM timeouts, generation
+  options such as temperature and token budget, and `EMCS_ENTROPY_WEIGHT`.
 - Docker Compose loads `.env.example` directly with `env_file` for the API
   and Ollama model-pull helper.
 - `Backend/app/config.py` is the Python-facing settings loader. It reads the
@@ -330,11 +328,16 @@ Backend/prompts/
 - `sql_generation.yaml` contains Qwen SQL-generation role and safety instructions.
 - `answer.yaml` contains Qwen grounded answer-writing instructions.
 - `explanation.yaml` contains Qwen grounded explanation-writing instructions.
-- `followups.yaml` contains Qwen follow-up suggestion instructions.
 - `judge.yaml` contains Qwen answer-support value and evaluator-confidence instructions.
 
 The YAML files guide the local models only. SQL execution safety is still
 enforced in Python by `db.is_safe_select()`.
+
+Model runtime behavior is split into three config groups: model selection,
+timeout, and generation options. Router, SQL, and judge calls default to low
+temperature for stable structured outputs; answer and explanation calls use
+slightly higher temperatures for more natural language while staying grounded
+in returned evidence.
 
 Blueprint configuration notes:
 
@@ -343,7 +346,7 @@ Blueprint configuration notes:
 - SQL generation node: loads `sql_generation.yaml`; Qwen generates candidate `SELECT` SQL for the `run_sql` path only.
 - Answer-writing node: loads `answer.yaml`; Qwen rewrites the deterministic draft from returned rows into the final answer.
 - Explanation node: loads `explanation.yaml`; Qwen writes the main `explanation` from returned data and business rules.
-- Follow-up node: loads `followups.yaml`; Qwen returns 2-3 planner-relevant next questions.
+- Follow-ups: static suggestions keep the API/UI field without adding another LLM call.
 - Confidence node: deterministic paths use app-owned EMCS inputs; generated-SQL paths can load `judge.yaml` so Qwen returns value, confidence, verdict, reason, and issues.
 - SQL safety node: Python rejects non-SELECT SQL, destructive SQL, and multiple statements before execution.
 - Entity validation node: Python checks extracted work-order and machine IDs against PostgreSQL before routing.

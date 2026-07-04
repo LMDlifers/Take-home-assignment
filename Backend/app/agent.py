@@ -33,7 +33,6 @@ LLM_SQL_MODEL = settings.llm_sql_model
 LLM_JUDGE_MODEL = settings.llm_judge_model
 LLM_ANSWER_MODEL = settings.llm_answer_model
 LLM_EXPLANATION_MODEL = settings.llm_explanation_model
-LLM_FOLLOWUP_MODEL = settings.llm_followup_model
 ROUTER_FALLBACK_REASONING = "DeepSeek router reasoning was unavailable; deterministic parsing routed this request."
 JUDGE_FALLBACK_REASON = "Judge unavailable; kept deterministic fallback confidence."
 EMCS_ENTROPY_WEIGHT = settings.emcs_entropy_weight
@@ -84,14 +83,6 @@ class ConfidenceJudgeResponse(BaseModel):
     verdict: Literal["supported", "partially_supported", "unsupported", "not_applicable"]
     reason: str
     issues: list[str] = Field(default_factory=list)
-
-
-class FollowUpResponse(BaseModel):
-    """Structured planner follow-up suggestions."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    follow_ups: list[str] = Field(default_factory=list, max_length=3)
 
 
 SCHEDULING_TERMS = {
@@ -365,16 +356,6 @@ def answer_from_data(
         explanation_generation["source"] = "llm"
     except (httpx.HTTPError, ValueError, KeyError, TypeError):
         explanation_generation["reason"] = "Explanation model unavailable; kept deterministic draft."
-    follow_ups = DEFAULT_FOLLOW_UPS
-    followup_generation = {
-        "source": "fallback",
-        "model": LLM_FOLLOWUP_MODEL,
-    }
-    try:
-        follow_ups = generate_follow_ups(question, tool, data, answer, explanation)
-        followup_generation["source"] = "llm"
-    except (httpx.HTTPError, ValueError, ValidationError, KeyError, TypeError):
-        followup_generation["reason"] = "Follow-up model unavailable; kept default suggestions."
     return {
         "question": question,
         "tool_used": tool,
@@ -386,8 +367,7 @@ def answer_from_data(
         "_confidence_source": confidence_source,
         "_answer_generation": answer_generation,
         "_explanation_generation": explanation_generation,
-        "_followup_generation": followup_generation,
-        "follow_ups": follow_ups,
+        "follow_ups": DEFAULT_FOLLOW_UPS,
     }
 
 
@@ -412,12 +392,6 @@ def attach_trace(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
                 "explanation": response.get("explanation"),
                 **response.pop("_explanation_generation", {"source": "deterministic"}),
                 "note": "Explanation is LLM-written from retrieved evidence when available.",
-            },
-            {
-                "step": "followup_generation",
-                "follow_ups": response.get("follow_ups"),
-                **response.pop("_followup_generation", {"source": "deterministic"}),
-                "note": "Follow-ups are LLM-written from the response context when available.",
             },
             {"step": "audit_log", "status": "best_effort"},
         ]
@@ -539,7 +513,10 @@ def judge_confidence(response: dict[str, Any]) -> ConfidenceJudgeResponse:
         [{"role": "user", "content": judge_prompt(response)}],
         model=LLM_JUDGE_MODEL,
         format_schema=ConfidenceJudgeResponse.model_json_schema(),
-        options={"temperature": 0, "num_predict": 200},
+        options={
+            "temperature": settings.llm_judge_temperature,
+            "num_predict": settings.llm_judge_num_predict,
+        },
         timeout=settings.llm_judge_timeout_seconds,
     )
     return ConfidenceJudgeResponse.model_validate_json(content)
@@ -894,7 +871,10 @@ def route_question_with_slm(question: str) -> RouterResult:
     content = ollama_chat(
         [{"role": "user", "content": prompt}],
         model=LLM_ROUTER_MODEL,
-        options={"temperature": 0, "num_predict": 160},
+        options={
+            "temperature": settings.llm_router_temperature,
+            "num_predict": settings.llm_router_num_predict,
+        },
         timeout=settings.llm_router_timeout_seconds,
     )
     return parse_router_response(content)
@@ -942,7 +922,7 @@ def normalize_extracted(extracted: ExtractedQuestion) -> ExtractedQuestion:
         reason=extracted.reason,
     )
 
-
+# Deterministic layer
 def validate_entities(question: str, extracted: ExtractedQuestion) -> dict[str, Any] | None:
     """Fail fast when extracted entities do not exist in live data."""
     for wo_id in extracted.work_order_ids:
@@ -1018,7 +998,10 @@ def generate_sql(question: str) -> tuple[str, tuple[Any, ...]]:
         ],
         model=LLM_SQL_MODEL,
         format_schema=SQLResponse.model_json_schema(),
-        options={"temperature": 0, "num_predict": 200},
+        options={
+            "temperature": settings.llm_sql_temperature,
+            "num_predict": settings.llm_sql_num_predict,
+        },
         timeout=settings.llm_sql_timeout_seconds,
     )
     generated = SQLResponse.model_validate_json(content)
@@ -1075,11 +1058,6 @@ def answer_config() -> dict[str, Any]:
 def explanation_config() -> dict[str, Any]:
     """Return Qwen grounded explanation-writing role and rules."""
     return load_prompt("explanation.yaml")
-
-
-def followup_config() -> dict[str, Any]:
-    """Return Qwen follow-up suggestion role and rules."""
-    return load_prompt("followups.yaml")
 
 
 def router_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
@@ -1187,36 +1165,15 @@ def explanation_prompt(
     )
 
 
-def followup_prompt(
-    question: str,
-    tool: str,
-    data: list[dict[str, Any]],
-    answer: str,
-    explanation: str,
-) -> str:
-    """Build the grounded follow-up suggestion prompt from YAML."""
-    config = followup_config()
-    evidence = {
-        "question": question,
-        "tool_used": tool,
-        "data": data,
-        "answer": answer,
-        "explanation": explanation,
-    }
-    return config["template"].format(
-        role=config["agent"]["role"],
-        purpose=config["agent"]["model_purpose"],
-        rules=yaml.safe_dump(config["rules"], sort_keys=False),
-        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
-    )
-
-
 def freestyle_answer(question: str, tool: str, sql: str | None, data: list[dict[str, Any]], draft: str) -> str:
     """Ask Qwen to write the final answer using only returned evidence."""
     content = ollama_chat(
         [{"role": "user", "content": answer_prompt(question, tool, sql, data, draft)}],
         model=LLM_ANSWER_MODEL,
-        options={"temperature": 0.4, "num_predict": 160},
+        options={
+            "temperature": settings.llm_answer_temperature,
+            "num_predict": settings.llm_answer_num_predict,
+        },
         timeout=settings.llm_answer_timeout_seconds,
     ).strip()
     if not content:
@@ -1236,33 +1193,15 @@ def explain_result(
     content = ollama_chat(
         [{"role": "user", "content": explanation_prompt(question, tool, sql, data, draft, answer)}],
         model=LLM_EXPLANATION_MODEL,
-        options={"temperature": 0.3, "num_predict": 220},
+        options={
+            "temperature": settings.llm_explanation_temperature,
+            "num_predict": settings.llm_explanation_num_predict,
+        },
         timeout=settings.llm_explanation_timeout_seconds,
     ).strip()
     if not content:
         raise ValueError("Explanation model returned empty content.")
     return content
-
-
-def generate_follow_ups(
-    question: str,
-    tool: str,
-    data: list[dict[str, Any]],
-    answer: str,
-    explanation: str,
-) -> list[str]:
-    """Ask Qwen for planner-relevant follow-up questions."""
-    content = ollama_chat(
-        [{"role": "user", "content": followup_prompt(question, tool, data, answer, explanation)}],
-        model=LLM_FOLLOWUP_MODEL,
-        format_schema=FollowUpResponse.model_json_schema(),
-        options={"temperature": 0.2, "num_predict": 128},
-        timeout=settings.llm_followup_timeout_seconds,
-    )
-    follow_ups = [item.strip() for item in FollowUpResponse.model_validate_json(content).follow_ups if item.strip()]
-    if not follow_ups:
-        raise ValueError("Follow-up model returned no suggestions.")
-    return follow_ups[:3]
 
 
 def fallback_answer(data: list[dict[str, Any]]) -> str:

@@ -9,11 +9,9 @@ def test_settings_expose_core_runtime_config() -> None:
     assert settings.llm_judge_model
     assert settings.llm_answer_model
     assert settings.llm_explanation_model
-    assert settings.llm_followup_model
     assert settings.llm_router_timeout_seconds > 0
     assert settings.llm_sql_timeout_seconds > 0
     assert settings.llm_judge_timeout_seconds > 0
     assert settings.llm_answer_timeout_seconds > 0
     assert settings.llm_explanation_timeout_seconds > 0
-    assert settings.llm_followup_timeout_seconds > 0
     assert 0 <= settings.emcs_entropy_weight <= 1

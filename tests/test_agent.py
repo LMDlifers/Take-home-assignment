@@ -21,8 +21,6 @@ def fake_qwen_response(messages, **kwargs):
         return '{"query":"SELECT wo_id FROM work_orders","params":[]}'
     if schema == agent.ConfidenceJudgeResponse.model_json_schema():
         return '{"value_estimate":0.75,"confidence_score":0.9,"verdict":"supported","reason":"The answer is supported by the returned data.","issues":[]}'
-    if schema == agent.FollowUpResponse.model_json_schema():
-        return '{"follow_ups":["Which orders should be handled first?","Which machine is the next bottleneck?"]}'
     if "Scheduling classify-route-plan assistant" in prompt:
         lower_prompt = prompt.lower()
         if "question: what happens if machine beta" in lower_prompt:
@@ -50,7 +48,6 @@ def no_audit_log(monkeypatch) -> None:
             agent.LLM_JUDGE_MODEL,
             agent.LLM_ANSWER_MODEL,
             agent.LLM_EXPLANATION_MODEL,
-            agent.LLM_FOLLOWUP_MODEL,
         }:
             return fake_qwen_response(messages, **kwargs)
         raise AssertionError("unexpected Ollama call")
@@ -613,7 +610,6 @@ def test_prompt_files_load() -> None:
     assert agent.judge_config()["rules"]
     assert agent.answer_config()["rules"]
     assert agent.explanation_config()["rules"]
-    assert agent.followup_config()["rules"]
     assert agent.entity_extraction_config()["examples"]
 
 
