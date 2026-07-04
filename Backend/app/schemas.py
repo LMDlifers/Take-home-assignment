@@ -17,6 +17,7 @@ class MachineLoadResponse(BaseModel):
     available_hours_today: float
     current_status: str
     queued_hours: float
+    active_order_count: int | None = None
     load_pct: float
     load_status: str
 
@@ -72,3 +73,4 @@ class AskResponse(BaseModel):
     explanation: str
     confidence: float
     follow_ups: list[str]
+    trace: list[dict] = Field(default_factory=list)

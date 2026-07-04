@@ -133,6 +133,7 @@ def test_ask_route_returns_response_shape(monkeypatch) -> None:
             "explanation": "M3 is overloaded.",
             "confidence": 0.75,
             "follow_ups": ["Show high-priority orders due this week."],
+            "trace": [{"step": "scope_check", "in_scope": True}],
         },
     )
 
@@ -143,3 +144,4 @@ def test_ask_route_returns_response_shape(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["tool_used"] == "check_load"
+    assert response.json()["trace"][0]["step"] == "scope_check"

@@ -10,6 +10,21 @@ from app import db
 @pytest.fixture(autouse=True)
 def no_audit_log(monkeypatch) -> None:
     monkeypatch.setattr(db, "log_agent_action", lambda **kwargs: None)
+    monkeypatch.setattr(db, "work_order_exists", lambda wo_id: True)
+    monkeypatch.setattr(db, "machine_exists", lambda machine_id: True)
+    monkeypatch.setattr(db, "get_machine_aliases", lambda: [])
+
+    def fake_ollama_chat(messages, **kwargs):
+        if kwargs.get("model") == agent.LLM_ROUTER_MODEL:
+            prompt = messages[0]["content"].lower()
+            if "question:\nwhat happens if machine beta" in prompt:
+                return '<think>Machine beta maps to M2, and the user asks for a four-hour downtime simulation.</think>{"intent":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null}'
+            return '<think>The question is in the scheduling domain, so deterministic parsing can provide the route and entities.</think>{"intent":"unknown","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
+        if kwargs.get("model") == agent.LLM_JUDGE_MODEL:
+            return '{"confidence_score":0.75,"verdict":"supported","reason":"The answer is supported by the returned data.","issues":[]}'
+        raise AssertionError("unexpected Ollama call")
+
+    monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
 
 
 def fail_if_generate_sql_called(question: str) -> tuple[str, tuple]:
@@ -68,25 +83,23 @@ def test_six_assessment_questions_route_to_expected_tools() -> None:
 def test_ask_uses_generated_safe_sql(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT wo_id FROM work_orders", ()))
     monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
-    response = agent.answer_question("Which work orders are delayed?")
+    response = agent.answer_question("Show all work orders")
 
     assert response["tool_used"] == "run_sql"
     assert response["sql_used"] == "SELECT wo_id FROM work_orders"
-    assert response["answer"] == "WO-1003 is delayed."
+    assert response["answer"] == "Work orders returned: WO-1003."
 
 
 def test_successful_run_sql_is_logged(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT wo_id FROM work_orders", ()))
     monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
-    agent.answer_question("Which work orders are delayed?")
+    agent.answer_question("Show all work orders")
 
     assert logs[0]["action_type"] == "query_generated"
-    assert logs[0]["input_question"] == "Which work orders are delayed?"
+    assert logs[0]["input_question"] == "Show all work orders"
     assert logs[0]["sql_generated"] == "SELECT wo_id FROM work_orders"
     assert logs[0]["confidence"] == 0.75
     assert logs[0]["result_summary"] == "Found 1 work orders: WO-1003."
@@ -94,7 +107,6 @@ def test_successful_run_sql_is_logged(monkeypatch) -> None:
 
 def test_check_load_tool_uses_deterministic_query(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "M3 is overloaded.")
     monkeypatch.setattr(db, "get_machines", sample_machines)
     monkeypatch.setattr(db, "get_open_orders", sample_open_orders)
 
@@ -103,12 +115,13 @@ def test_check_load_tool_uses_deterministic_query(monkeypatch) -> None:
     assert response["tool_used"] == "check_load"
     assert "v_machine_load" in response["sql_used"]
     assert [row["machine_id"] for row in response["data"]] == ["M3", "M6", "M5"]
+    assert response["answer"] != response["explanation"]
+    assert "deterministic parsing" in response["explanation"]
 
 
 def test_check_load_is_logged_as_query_generated(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "M3 is overloaded.")
     monkeypatch.setattr(db, "get_machines", lambda: [sample_machines()[0]])
     monkeypatch.setattr(db, "get_open_orders", lambda: sample_open_orders()[:3])
 
@@ -120,7 +133,6 @@ def test_check_load_is_logged_as_query_generated(monkeypatch) -> None:
 
 def test_get_priority_tool_uses_priority_view(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "High-priority orders are due soon.")
     monkeypatch.setattr(
         db,
         "get_priority_orders",
@@ -134,9 +146,8 @@ def test_get_priority_tool_uses_priority_view(monkeypatch) -> None:
     assert response["data"][0]["wo_id"] == "WO-1001"
 
 
-def test_get_priority_tool_returns_expected_p1_due_this_week(monkeypatch) -> None:
+def test_get_priority_tool_returns_p1_and_p2_due_this_week(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "P1 orders are due soon.")
     monkeypatch.setattr(
         db,
         "get_priority_orders",
@@ -155,18 +166,20 @@ def test_get_priority_tool_returns_expected_p1_due_this_week(monkeypatch) -> Non
     response = agent.answer_question("Show high-priority orders due this week.")
 
     assert [row["wo_id"] for row in response["data"]] == [
-        "WO-1001",
+        "WO-1005",
         "WO-1002",
         "WO-1003",
-        "WO-1005",
+        "WO-1001",
         "WO-1007",
         "WO-1015",
+        "WO-1019",
+        "WO-1008",
     ]
+    assert "WO-1008" in response["answer"]
 
 
 def test_simulate_downtime_tool_parses_machine_and_hours(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1008 is affected.")
     monkeypatch.setattr(
         db,
         "get_machine",
@@ -197,7 +210,6 @@ def test_simulate_downtime_tool_parses_machine_and_hours(monkeypatch) -> None:
 def test_simulate_downtime_is_logged_as_simulation(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1008 is affected.")
     monkeypatch.setattr(
         db,
         "get_machine",
@@ -218,7 +230,6 @@ def test_simulate_downtime_is_logged_as_simulation(monkeypatch) -> None:
 
 def test_recommend_tool_uses_deterministic_rules(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "Escalate M4 and rebalance M5.")
     monkeypatch.setattr(db, "get_machines", sample_machines)
     monkeypatch.setattr(db, "get_open_orders", sample_open_orders)
     monkeypatch.setattr(
@@ -254,7 +265,6 @@ def test_recommend_tool_uses_deterministic_rules(monkeypatch) -> None:
 def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
     logs = capture_audit_logs(monkeypatch)
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "Escalate M4.")
     monkeypatch.setattr(db, "get_machines", lambda: [sample_machines()[2]])
     monkeypatch.setattr(db, "get_open_orders", lambda: sample_open_orders()[5:])
     monkeypatch.setattr(
@@ -286,7 +296,6 @@ def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
 
 def test_work_order_risk_question_uses_deterministic_view(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
-    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is blocked on M4.")
     monkeypatch.setattr(
         db,
         "get_at_risk_order",
@@ -305,16 +314,77 @@ def test_work_order_risk_question_uses_deterministic_view(monkeypatch) -> None:
     assert response["tool_used"] == "run_sql"
     assert "v_at_risk_orders" in response["sql_used"]
     assert response["data"][0]["wo_id"] == "WO-1003"
-    assert response["answer"] == "WO-1003 is blocked on M4."
+    assert response["answer"] == "WO-1003 is at risk: Machine M4 is unavailable."
+
+
+def test_shorthand_work_order_status_uses_fixed_query(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(
+        db,
+        "get_work_order_status",
+        lambda wo_id: [
+            {
+                "wo_id": wo_id,
+                "status": "delayed",
+                "required_machine": "M4",
+                "machine_status": "unavailable",
+            }
+        ],
+    )
+
+    response = agent.answer_question("what is 1003 current status?")
+
+    assert response["tool_used"] == "run_sql"
+    assert response["data"][0]["wo_id"] == "WO-1003"
+    assert response["answer"] == "WO-1003 is delayed, requires M4."
+    assert response["trace"][1]["step"] == "extract"
+    assert response["trace"][1]["result"]["work_order_ids"] == ["WO-1003"]
+    assert response["trace"][3]["step"] == "route"
+    assert response["trace"][3]["intent"] == "work_order_status"
+
+
+def test_missing_work_order_fails_before_sql(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(db, "work_order_exists", lambda wo_id: False)
+
+    response = agent.answer_question("is WO-9999 delayed?")
+
+    assert response["tool_used"] == "refuse"
+    assert response["answer"] == "Work order WO-9999 was not found."
+    assert response["trace"][2]["status"] == "failed"
+    assert response["trace"][3]["step"] == "confidence_judge"
+    assert response["trace"][3]["status"] == "skipped"
+
+
+def test_slm_can_extract_machine_alias_for_downtime(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(db, "get_machine_aliases", lambda: [{"machine_id": "M2", "machine_name": "CNC Machining Centre Beta", "machine_type": "CNC Mill"}])
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages, **kwargs: '{"intent":"simulate_downtime","work_order_ids":[],"machine_ids":["M2"],"downtime_hours":4,"priority_max":null,"due_window_days":null}',
+    )
+    monkeypatch.setattr(db, "get_machine", lambda machine_id: {"machine_id": machine_id, "available_hours_today": 4.5})
+    monkeypatch.setattr(
+        db,
+        "get_orders_for_simulation",
+        lambda machine_id: [{"wo_id": "WO-1008", "processing_time_hr": 5.5, "status": "pending"}],
+    )
+
+    response = agent.answer_question("what happens if machine beta is down 4 more hours?")
+
+    assert response["tool_used"] == "simulate_downtime"
+    assert response["data"][0]["machine_id"] == "M2"
+    assert response["data"][0]["affected_orders"][0]["wo_id"] == "WO-1008"
 
 
 def test_unsafe_generated_sql_is_rejected(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", lambda question: ("DELETE FROM work_orders", ()))
 
-    response = agent.answer_question("Which work orders are delayed?")
+    response = agent.answer_question("Show all work orders")
 
     assert response["data"] == []
-    assert response["confidence"] == 0.2
+    assert response["confidence"] == 0.75
 
 
 def test_out_of_scope_refusal_is_logged_as_clarification(monkeypatch) -> None:
@@ -364,22 +434,70 @@ def test_generate_sql_uses_structured_output(monkeypatch) -> None:
     assert calls[0]["options"] == {"temperature": 0}
 
 
-def test_explain_result_uses_explanation_model(monkeypatch) -> None:
+def test_route_question_uses_router_model(monkeypatch) -> None:
     calls = []
 
     def fake_ollama_chat(messages, **kwargs):
         calls.append(kwargs)
-        return "WO-1003 is blocked on M4."
+        return '<think>1003 is shorthand for WO-1003, and the user asks for status.</think>{"intent":"work_order_status","work_order_ids":["WO-1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
 
     monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
 
-    answer = agent.explain_result(
-        "Why is WO-1003 at risk?",
-        [{"wo_id": "WO-1003", "required_machine": "M4", "risk_reason": "Machine unavailable"}],
+    routed = agent.route_question_with_slm("what is 1003 current status?")
+
+    assert routed.extracted.work_order_ids == ["WO-1003"]
+    assert routed.reasoning.startswith("1003 is shorthand")
+    assert calls[0]["model"] == agent.LLM_ROUTER_MODEL
+    assert calls[0]["options"] == {"temperature": 0}
+    assert calls[0]["include_thinking"] is True
+
+
+def test_parse_router_response_splits_think_and_json() -> None:
+    routed = agent.parse_router_response(
+        '<think>Use the machine-load route.</think>{"intent":"machine_load","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
     )
 
-    assert answer == "WO-1003 is blocked on M4."
-    assert calls[0]["model"] == agent.LLM_EXPLANATION_MODEL
+    assert routed.reasoning == "Use the machine-load route."
+    assert routed.extracted.intent == "machine_load"
+
+
+def test_parse_router_response_tolerates_missing_think() -> None:
+    routed = agent.parse_router_response(
+        '{"intent":"work_order_status","work_order_ids":["1003"],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
+    )
+
+    assert routed.reasoning == agent.ROUTER_FALLBACK_REASONING
+    assert routed.extracted.work_order_ids == ["WO-1003"]
+
+
+def test_parse_router_response_tolerates_empty_think() -> None:
+    routed = agent.parse_router_response(
+        '<think></think>{"intent":"machine_load","work_order_ids":[],"machine_ids":[],"downtime_hours":null,"priority_max":null,"due_window_days":null}'
+    )
+
+    assert routed.reasoning == agent.ROUTER_FALLBACK_REASONING
+    assert routed.extracted.intent == "machine_load"
+
+
+def test_malformed_router_response_falls_back_to_deterministic(monkeypatch) -> None:
+    def broken_router(question):
+        raise ValueError("bad json")
+
+    monkeypatch.setattr(agent, "route_question_with_slm", broken_router)
+
+    routed = agent.extract_question("Which machines are overloaded?")
+
+    assert routed.extracted.intent == "machine_load"
+    assert routed.reasoning == agent.ROUTER_FALLBACK_REASONING
+
+
+def test_router_machine_ids_do_not_pollute_general_load_questions() -> None:
+    merged = agent.merge_extractions(
+        agent.ExtractedQuestion(intent="machine_load"),
+        agent.ExtractedQuestion(intent="machine_load", machine_ids=["M1", "M2"]),
+    )
+
+    assert merged.machine_ids == []
 
 
 def test_generate_sql_rejects_markdown_fenced_output(monkeypatch) -> None:
@@ -438,18 +556,20 @@ def test_db_error_returns_safe_run_sql_response(monkeypatch) -> None:
 
     monkeypatch.setattr(db, "fetch_all", broken_fetch_all)
 
-    response = agent.answer_question("Which work orders are delayed?")
+    response = agent.answer_question("Show all work orders")
 
     assert response["tool_used"] == "run_sql"
     assert response["sql_used"] == "SELECT wo_id FROM work_orders WHERE wo_id = %s"
     assert response["data"] == []
-    assert response["confidence"] == 0.2
+    assert response["confidence"] == 0.75
 
 
 def test_prompt_files_load() -> None:
     assert agent.schema_context()["schema"]["views"]["v_machine_load"]["purpose"]
     assert agent.sql_generation_config()["rules"]
-    assert agent.explanation_config()["rules"]
+    assert agent.router_config()["rules"]
+    assert agent.judge_config()["rules"]
+    assert agent.entity_extraction_config()["examples"]
 
 
 def test_sql_prompt_includes_known_values() -> None:
@@ -463,3 +583,132 @@ def test_sql_prompt_includes_known_values() -> None:
     assert "unavailable" in prompt
     assert "Critical" in prompt
     assert "load_pct > 100" in prompt
+
+
+def test_router_prompt_includes_aliases_and_examples() -> None:
+    prompt = agent.router_prompt(
+        "what happens if machine beta is down 4 more hours?",
+        [{"machine_id": "M2", "machine_name": "CNC Machining Centre Beta"}],
+    )
+
+    assert "Scheduling reasoning router" in prompt
+    assert "<think>" in prompt
+    assert "CNC Machining Centre Beta" in prompt
+    assert "WO-1003" in prompt
+    assert "simulate_downtime" in prompt
+
+
+def test_judge_confidence_uses_structured_output(monkeypatch) -> None:
+    calls = []
+
+    def fake_ollama_chat(messages, **kwargs):
+        calls.append({"messages": messages, **kwargs})
+        return '{"confidence_score":0.92,"verdict":"supported","reason":"The answer matches the data.","issues":[]}'
+
+    monkeypatch.setattr(agent, "ollama_chat", fake_ollama_chat)
+    judged = agent.judge_confidence(
+        {
+            "question": "Which machines are overloaded?",
+            "tool_used": "check_load",
+            "sql_used": "SELECT * FROM v_machine_load",
+            "data": [{"machine_id": "M3", "load_pct": 195}],
+            "answer": "The overloaded machines are M3 (195%).",
+            "confidence": 0.75,
+        }
+    )
+
+    assert judged.confidence_score == 0.92
+    assert calls[0]["model"] == agent.LLM_JUDGE_MODEL
+    assert calls[0]["format_schema"] == agent.ConfidenceJudgeResponse.model_json_schema()
+    assert calls[0]["options"] == {"temperature": 0}
+
+
+def test_judge_confidence_validates_score_range(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages, **kwargs: '{"confidence_score":1.5,"verdict":"supported","reason":"too high","issues":[]}',
+    )
+
+    with pytest.raises(agent.ValidationError):
+        agent.judge_confidence(
+            {
+                "question": "Which machines are overloaded?",
+                "tool_used": "check_load",
+                "sql_used": None,
+                "data": [],
+                "answer": "None.",
+                "confidence": 0.75,
+            }
+        )
+
+
+def test_apply_confidence_judge_falls_back_on_bad_output(monkeypatch) -> None:
+    trace = []
+    response = {
+        "question": "Which machines are overloaded?",
+        "tool_used": "check_load",
+        "sql_used": None,
+        "data": [],
+        "answer": "None.",
+        "confidence": 0.42,
+    }
+    monkeypatch.setattr(agent, "ollama_chat", lambda messages, **kwargs: "not json")
+
+    agent.apply_confidence_judge(response, trace)
+
+    assert response["confidence"] == 0.42
+    assert trace[0]["step"] == "confidence_judge"
+    assert trace[0]["status"] == "fallback"
+
+
+def test_apply_confidence_judge_uses_low_judge_score(monkeypatch) -> None:
+    trace = []
+    response = {
+        "question": "Which machines are overloaded?",
+        "tool_used": "check_load",
+        "sql_used": None,
+        "data": [{"machine_id": "M3"}],
+        "answer": "M9 is overloaded.",
+        "confidence": 0.75,
+    }
+    monkeypatch.setattr(
+        agent,
+        "ollama_chat",
+        lambda messages, **kwargs: '{"confidence_score":0.2,"verdict":"unsupported","reason":"M9 is not in the data.","issues":["Answer names a machine absent from data."]}',
+    )
+
+    agent.apply_confidence_judge(response, trace)
+
+    assert response["confidence"] == 0.2
+    assert trace[0]["verdict"] == "unsupported"
+
+
+def test_answer_question_includes_confidence_judge_trace(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(db, "get_machines", sample_machines)
+    monkeypatch.setattr(db, "get_open_orders", sample_open_orders)
+
+    response = agent.answer_question("Which machines are overloaded?")
+
+    judge_steps = [step for step in response["trace"] if step["step"] == "confidence_judge"]
+    assert judge_steps
+    assert judge_steps[0]["status"] == "ok"
+
+
+def test_judge_prompt_includes_answer_data_tool_and_sql() -> None:
+    prompt = agent.judge_prompt(
+        {
+            "question": "Which machines are overloaded?",
+            "tool_used": "check_load",
+            "sql_used": "SELECT * FROM v_machine_load",
+            "data": [{"machine_id": "M3", "load_pct": 195}],
+            "answer": "The overloaded machines are M3 (195%).",
+            "confidence": 0.75,
+        }
+    )
+
+    assert "check_load" in prompt
+    assert "SELECT * FROM v_machine_load" in prompt
+    assert "M3" in prompt
+    assert "The overloaded machines are M3" in prompt

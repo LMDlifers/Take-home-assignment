@@ -4,17 +4,15 @@ Owns database connection setup, safe read queries, and agent_action_log writes.
 Callers should receive plain Python data structures, not raw cursor objects.
 """
 
-import os
 import re
 from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/scheduling_db",
-)
+from app.config import settings
+
+DATABASE_URL = settings.database_url
 # SQL keywords blocked to enforce read-only execution safety
 FORBIDDEN_SQL = ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE")
 
@@ -50,6 +48,17 @@ SELECT wo_id, product_code, product_name, quantity, required_machine,
        processing_time_hr, priority, due_date, status, days_remaining
 FROM v_priority_queue
 ORDER BY priority ASC, due_date ASC, wo_id ASC
+"""
+
+WORK_ORDER_STATUS_SQL = """
+SELECT wo.wo_id, wo.product_code, p.product_name, wo.quantity,
+       wo.required_machine, m.machine_name, wo.processing_time_hr,
+       wo.priority, wo.due_date, wo.status, m.current_status AS machine_status,
+       m.available_hours_today, wo.notes
+FROM work_orders wo
+JOIN products p ON p.product_code = wo.product_code
+JOIN machines m ON m.machine_id = wo.required_machine
+WHERE wo.wo_id = %s
 """
 
 
@@ -106,6 +115,32 @@ def get_at_risk_orders() -> list[dict[str, Any]]:
 def get_at_risk_order(wo_id: str) -> list[dict[str, Any]]:
     """Return one at-risk work order from the seeded view."""
     return fetch_all(AT_RISK_ORDER_SQL, (wo_id,))
+
+
+def work_order_exists(wo_id: str) -> bool:
+    """Return whether one work order exists."""
+    return bool(fetch_all("SELECT 1 AS found FROM work_orders WHERE wo_id = %s", (wo_id,)))
+
+
+def machine_exists(machine_id: str) -> bool:
+    """Return whether one machine exists."""
+    return bool(fetch_all("SELECT 1 AS found FROM machines WHERE machine_id = %s", (machine_id,)))
+
+
+def get_work_order_status(wo_id: str) -> list[dict[str, Any]]:
+    """Return status and scheduling context for one work order."""
+    return fetch_all(WORK_ORDER_STATUS_SQL, (wo_id,))
+
+
+def get_machine_aliases() -> list[dict[str, str]]:
+    """Return machine names used to resolve natural-language machine references."""
+    return fetch_all(
+        """
+        SELECT machine_id, machine_name, machine_type
+        FROM machines
+        ORDER BY machine_id ASC
+        """
+    )
 
 
 def get_priority_queue() -> list[dict[str, Any]]:

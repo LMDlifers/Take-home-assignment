@@ -4,6 +4,9 @@ agent:
 
 rules:
   - "Return one PostgreSQL SELECT query only."
+  - "Return JSON only."
+  - "Put the PostgreSQL SELECT statement in query."
+  - "Use params for placeholder values in order."
   - "Do not use markdown."
   - "Do not generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE."
   - "Do not generate multiple SQL statements."
@@ -14,3 +17,35 @@ rules:
   - "Use v_machine_load for overload and capacity questions."
   - "Use v_at_risk_orders for risk, blocked, delayed, or cannot-complete questions."
   - "Use v_priority_queue for priority and due-soon questions."
+
+examples:
+  - question: "Which work orders are delayed?"
+    query: "SELECT wo_id, status, due_date FROM work_orders WHERE status = 'delayed' ORDER BY due_date ASC, wo_id ASC"
+    params: []
+  - question: "Why is WO-1003 at risk?"
+    query: "SELECT wo_id, required_machine, status, machine_status, risk_reason FROM v_at_risk_orders WHERE wo_id = %s"
+    params: ["WO-1003"]
+  - question: "Show high-priority orders due this week."
+    query: "SELECT wo_id, priority, due_date, status, days_remaining FROM v_priority_queue WHERE priority <= 2 AND days_remaining <= 7 ORDER BY priority ASC, due_date ASC, wo_id ASC"
+    params: []
+
+template: |
+  {role}
+
+  Purpose:
+  {purpose}
+
+  Schema context:
+  {schema}
+
+  Known values:
+  {known_values}
+
+  Business rules:
+  {business_rules}
+
+  Rules:
+  {rules}
+
+  Examples:
+  {examples}

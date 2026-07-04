@@ -6,6 +6,8 @@ core correctness.
 """
 
 from datetime import date
+from decimal import Decimal
+from decimal import ROUND_HALF_UP
 from typing import Any
 
 
@@ -15,7 +17,7 @@ def load_status(load_pct: float) -> str:
         return "overloaded"
     if load_pct > 85:
         return "at_risk"
-    return "normal"
+    return "normal" #Anything 85% or below is considered normal.
 
 
 def add_load_status(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -34,17 +36,22 @@ def calculate_machine_loads(
 ) -> list[dict[str, Any]]:
     """Calculate queued machine load in application code."""
     queued_by_machine = {machine["machine_id"]: 0.0 for machine in machines}
+    active_count_by_machine = {machine["machine_id"]: 0 for machine in machines}
     for order in orders:
         if order["status"] in {"pending", "in_progress"}:
             queued_by_machine[order["required_machine"]] += float(order["processing_time_hr"])
+            active_count_by_machine[order["required_machine"]] += 1
 
     rows = []
     for machine in machines:
         capacity = float(machine["capacity_hours_day"])
         queued = queued_by_machine[machine["machine_id"]]
-        load_pct = round(queued / capacity * 100, 1) if capacity else 0
+        load_pct = float(
+            Decimal(str(queued / capacity * 100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        ) if capacity else 0
         row = dict(machine)
         row["queued_hours"] = queued
+        row["active_order_count"] = active_count_by_machine[machine["machine_id"]]
         row["load_pct"] = load_pct
         row["load_status"] = load_status(load_pct)
         rows.append(row)
@@ -142,7 +149,7 @@ def recommend_actions(
         )
 
     for order in at_risk_orders:
-        if order.get("status") == "delayed" and order.get("required_machine") != "M4":
+        if order.get("status") == "delayed" and order.get("machine_status") != "unavailable":
             recommendations.append(
                 {
                     "action": f"Reroute or split {order['wo_id']}",

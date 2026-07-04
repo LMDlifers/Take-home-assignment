@@ -1,17 +1,18 @@
 """Agent orchestration for natural-language planning questions.
 
-Classifies whether a question is in scope, routes it to the right tool, calls
-deterministic data/business functions, asks the LLM to explain retrieved facts,
-and logs each action for auditability.
+Classifies whether a question is in scope, asks the router model for visible
+reasoning, routes to the right tool, and logs each action for auditability.
 """
 
 import json
-import os
 import re
 import uuid
+from decimal import Decimal
+from decimal import ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 import httpx
 import psycopg
@@ -23,10 +24,14 @@ from pydantic import ValidationError
 
 from app import db
 from app import logic
+from app.config import settings
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-LLM_SQL_MODEL = os.getenv("LLM_SQL_MODEL", os.getenv("LLM_MODEL", "qwen2.5:3b"))
-LLM_EXPLANATION_MODEL = os.getenv("LLM_EXPLANATION_MODEL", "llama3.1:8b")
+OLLAMA_BASE_URL = settings.ollama_base_url
+LLM_ROUTER_MODEL = settings.llm_router_model
+LLM_SQL_MODEL = settings.llm_sql_model
+LLM_JUDGE_MODEL = settings.llm_judge_model
+ROUTER_FALLBACK_REASONING = "DeepSeek router reasoning was unavailable; deterministic parsing routed this request."
+JUDGE_FALLBACK_REASON = "Judge unavailable; kept deterministic fallback confidence."
 
 
 class SQLResponse(BaseModel):
@@ -37,7 +42,42 @@ class SQLResponse(BaseModel):
     query: str
     params: list[str | int | float] = Field(default_factory=list)
 
+
+class ExtractedQuestion(BaseModel):
+    """Structured intent and entities extracted from a user question."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str = "unknown"
+    work_order_ids: list[str] = Field(default_factory=list)
+    machine_ids: list[str] = Field(default_factory=list)
+    downtime_hours: float | None = None
+    priority_max: int | None = None
+    due_window_days: int | None = None
+
+
+class RouterResult(BaseModel):
+    """Router extraction plus the model-visible reasoning used for explanation."""
+
+    extracted: ExtractedQuestion
+    reasoning: str = ROUTER_FALLBACK_REASONING
+    used_model: str | None = None
+
+
+class ConfidenceJudgeResponse(BaseModel):
+    """Structured answer-support score from the judge model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    verdict: Literal["supported", "partially_supported", "unsupported", "not_applicable"]
+    reason: str
+    issues: list[str] = Field(default_factory=list)
+
+
 SCHEDULING_TERMS = {
+    "order",
+    "orders",
     "machine",
     "machines",
     "work order",
@@ -52,34 +92,80 @@ SCHEDULING_TERMS = {
     "priority",
     "due",
     "schedule",
+    "status",
     "downtime",
+}
+
+INTENT_TO_TOOL = {
+    "machine_load": "check_load",
+    "simulate_downtime": "simulate_downtime",
+    "priority_orders": "get_priority",
+    "recommend_actions": "recommend",
+    "work_order_count": "count_orders",
+    "work_order_risk": "run_sql",
+    "work_order_status": "run_sql",
+    "delayed_orders": "delayed_orders",
 }
 
 
 def answer_question(question: str) -> dict[str, Any]:
     """Answer one natural-language planning question."""
     session_id = str(uuid.uuid4()) # for recording into agent_action_log database
+    trace: list[dict[str, Any]] = []
 
-    if not is_planning_question(question):
+    in_scope = is_planning_question(question)
+    trace.append({"step": "scope_check", "in_scope": in_scope})
+    if not in_scope:
         response = refuse_response(question)
+        skip_confidence_judge(trace, "Out-of-scope refusal is deterministic.")
+        attach_trace(response, trace)
         safe_log_action(session_id, response)
         return response
 
-    # routing is currently keyword driven 
-    tool = route_tool(question)
+    routed = extract_question(question)
+    extracted = routed.extracted
+    trace.append(
+        {
+            "step": "extract",
+            "result": extracted.model_dump(),
+            "reasoning": routed.reasoning,
+            "model": routed.used_model,
+        }
+    )
+    validation_response = validate_entities(question, extracted)
+    if validation_response is not None:
+        trace.append({"step": "entity_validation", "status": "failed", "message": validation_response["answer"]})
+        validation_response["explanation"] = routed.reasoning
+        skip_confidence_judge(trace, "Entity validation failure is deterministic.")
+        attach_trace(validation_response, trace)
+        safe_log_action(session_id, validation_response)
+        return validation_response
+    trace.append({"step": "entity_validation", "status": "passed"})
+
+    tool = route_extracted(question, extracted)
+    trace.append({"step": "route", "tool": tool, "intent": extracted.intent})
     if tool == "check_load":
         response = check_load_tool(question)
     elif tool == "get_priority":
-        response = get_priority_tool(question)
+        response = get_priority_tool(question, extracted)
     elif tool == "simulate_downtime":
-        response = simulate_downtime_tool(question)
+        response = simulate_downtime_tool(question, extracted)
     elif tool == "recommend":
         response = recommend_tool(question)
-    elif is_work_order_risk_question(question):
-        response = work_order_risk_tool(question)
+    elif tool == "count_orders":
+        response = count_orders_tool(question, extracted)
+    elif tool == "delayed_orders":
+        response = delayed_orders_tool(question)
+    elif extracted.intent == "work_order_status":
+        response = work_order_status_tool(question, extracted)
+    elif extracted.intent == "work_order_risk" or is_work_order_risk_question(question):
+        response = work_order_risk_tool(question, extracted)
     else:
         response = run_sql_tool(question, tool)
 
+    response["explanation"] = routed.reasoning
+    apply_confidence_judge(response, trace)
+    attach_trace(response, trace)
     safe_log_action(session_id, response)
     return response
 
@@ -106,37 +192,51 @@ def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
 
 def check_load_tool(question: str) -> dict[str, Any]:
     """Answer load questions with deterministic Python load calculation."""
+    q = question.lower()
     data = logic.calculate_machine_loads(db.get_machines(), db.get_open_orders())
-    if "overloaded" in question.lower():
+    if "not overloaded" in q or "not over loaded" in q:
+        data = [row for row in data if row["load_status"] != "overloaded"]
+    elif "overloaded" in q:
         data = [row for row in data if row["load_status"] == "overloaded"]
+    elif "unavailable" in q:
+        data = [row for row in data if row["current_status"] == "unavailable"]
+    elif "partially available" in q or "partial" in q:
+        data = [row for row in data if row["current_status"] == "partial"]
     return answer_from_data(question, "check_load", db.MACHINE_LOAD_SQL.strip(), data)
 
 
-def get_priority_tool(question: str) -> dict[str, Any]:
+def get_priority_tool(question: str, extracted: ExtractedQuestion | None = None) -> dict[str, Any]:
     """Answer priority and due-soon questions with deterministic filtering."""
     q = question.lower()
-    # Detect explicit P2 wording such as "P2", "priority 2", or "priority two".
-    max_priority = 2 if re.search(r"\b(?:p2|priority\s*2|priority\s*two)\b", q) else 1
-    # ponytail: seed brief expects critical orders due by tomorrow; widen if planners need full-week P1s.
-    due_limit = 7 if max_priority == 2 else 1
+    max_priority = extracted.priority_max if extracted and extracted.priority_max else None
+    if max_priority is None:
+        max_priority = 2 if re.search(r"\b(?:high.priority|p2|priority\s*2|priority\s*two)\b", q) else 1
+    due_limit = extracted.due_window_days if extracted and extracted.due_window_days else None
+    if due_limit is None:
+        due_limit = 7 if "week" in q else 3
     data = [
         row
         for row in db.get_priority_orders()
         if int(row["priority"]) <= max_priority and int(row["days_remaining"]) <= due_limit
     ]
+    data = sorted(data, key=lambda row: (int(row["priority"]), int(row["days_remaining"]), row["wo_id"]))
     return answer_from_data(question, "get_priority", db.PRIORITY_QUEUE_SQL.strip(), data)
 
 
-def simulate_downtime_tool(question: str) -> dict[str, Any]:
+def simulate_downtime_tool(question: str, extracted: ExtractedQuestion | None = None) -> dict[str, Any]:
     """Parse one machine and downtime duration, then run deterministic simulation."""
-    # Extract a machine ID token such as M2.
-    machine_match = re.search(r"\bM\d+\b", question, flags=re.IGNORECASE)
-    # Extract a duration phrase such as "4 hours" or "4 extra hrs".
-    hours_match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(?:extra\s+|additional\s+|more\s+)?(?:hours?|hrs?|hr|h)\b",
-        question.lower(),
-    )
-    if machine_match is None or hours_match is None:
+    machine_id = (extracted.machine_ids[0] if extracted and extracted.machine_ids else None)
+    downtime_hours = extracted.downtime_hours if extracted else None
+    if machine_id is None:
+        machine_match = re.search(r"\bM\d+\b", question, flags=re.IGNORECASE)
+        machine_id = machine_match.group(0).upper() if machine_match else None
+    if downtime_hours is None:
+        hours_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:extra\s+|additional\s+|more\s+)?(?:hours?|hrs?|hr|h)\b",
+            question.lower(),
+        )
+        downtime_hours = float(hours_match.group(1)) if hours_match else None
+    if machine_id is None or downtime_hours is None:
         return {
             "question": question,
             "tool_used": "simulate_downtime",
@@ -148,8 +248,6 @@ def simulate_downtime_tool(question: str) -> dict[str, Any]:
             "follow_ups": ["What happens if M2 is down for 4 extra hours?"],
         }
 
-    machine_id = machine_match.group(0).upper()
-    downtime_hours = float(hours_match.group(1))
     machine = db.get_machine(machine_id)
     if machine is None:
         return {
@@ -181,9 +279,43 @@ def recommend_tool(question: str) -> dict[str, Any]:
     return answer_from_data(question, "recommend", None, data, confidence=0.8)
 
 
-def work_order_risk_tool(question: str) -> dict[str, Any]:
+def delayed_orders_tool(question: str) -> dict[str, Any]:
+    """Return delayed work orders from a fixed read query."""
+    sql = """
+SELECT wo_id, status, due_date, required_machine, priority
+FROM work_orders
+WHERE status = 'delayed'
+ORDER BY wo_id ASC
+"""
+    try:
+        data = db.fetch_all(sql)
+    except (ValueError, psycopg.Error) as error:
+        return sql_error_response(question, "run_sql", sql.strip(), f"The fixed delayed-orders query failed safely: {error}")
+    return answer_from_data(question, "run_sql", sql.strip(), data)
+
+
+def count_orders_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
+    """Answer simple work-order status count questions without generated SQL."""
+    status = count_status_from_question(question)
+    if status is None:
+        return run_sql_tool(question)
+    sql = "SELECT status, COUNT(*)::int AS count FROM work_orders WHERE status = %s GROUP BY status"
+    data = db.fetch_all(sql, (status,)) or [{"status": status, "count": 0}]
+    return answer_from_data(question, "run_sql", sql, data)
+
+
+def work_order_status_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
+    """Answer direct work-order status questions from a fixed status query."""
+    wo_id = first_work_order_id(question, extracted)
+    if wo_id is None:
+        return run_sql_tool(question)
+    data = db.get_work_order_status(wo_id)
+    return answer_from_data(question, "run_sql", db.WORK_ORDER_STATUS_SQL.strip(), data)
+
+
+def work_order_risk_tool(question: str, extracted: ExtractedQuestion | None = None) -> dict[str, Any]:
     """Answer direct work-order risk questions from the seeded risk view."""
-    wo_id = extract_work_order_id(question)
+    wo_id = first_work_order_id(question, extracted)
     if wo_id is None:
         return run_sql_tool(question)
 
@@ -199,17 +331,193 @@ def answer_from_data(
     confidence: float = 0.75,
 ) -> dict[str, Any]:
     """Build the common /ask response from retrieved or computed data."""
-    explanation = explain_result(question, data)
+    answer = deterministic_answer(question, tool, data) or fallback_answer(data)
     return {
         "question": question,
         "tool_used": tool,
         "sql_used": sql,
         "data": data,
-        "answer": explanation,
-        "explanation": explanation,
+        "answer": answer,
+        "explanation": ROUTER_FALLBACK_REASONING,
         "confidence": confidence,
         "follow_ups": ["Which machines are causing the most delays?", "Show high-priority orders due this week."],
     }
+
+
+def attach_trace(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
+    """Attach observable pipeline trace."""
+    trace.extend(
+        [
+            {
+                "step": "tool_result",
+                "tool": response.get("tool_used"),
+                "sql_used": response.get("sql_used"),
+                "rows": len(response.get("data") or []),
+            },
+            {
+                "step": "answer_generation",
+                "answer": response.get("answer"),
+                "explanation": response.get("explanation"),
+                "note": "Answer is built from retrieved data; explanation is parsed from the DeepSeek router <think> block when available.",
+            },
+            {"step": "audit_log", "status": "best_effort"},
+        ]
+    )
+    response["trace"] = trace
+
+
+def skip_confidence_judge(trace: list[dict[str, Any]], reason: str) -> None:
+    """Record that confidence stayed deterministic."""
+    trace.append({"step": "confidence_judge", "status": "skipped", "reason": reason})
+
+
+def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
+    """Replace fallback confidence with an evidence-support score when possible."""
+    try:
+        judged = judge_confidence(response)
+    except (httpx.HTTPError, ValueError, ValidationError, KeyError, TypeError):
+        trace.append(
+            {
+                "step": "confidence_judge",
+                "status": "fallback",
+                "model": LLM_JUDGE_MODEL,
+                "reason": JUDGE_FALLBACK_REASON,
+                "score": response.get("confidence"),
+            }
+        )
+        return
+
+    response["confidence"] = judged.confidence_score
+    trace.append(
+        {
+            "step": "confidence_judge",
+            "status": "ok",
+            "model": LLM_JUDGE_MODEL,
+            "score": judged.confidence_score,
+            "verdict": judged.verdict,
+            "reason": judged.reason,
+            "issues": judged.issues,
+        }
+    )
+
+
+def judge_confidence(response: dict[str, Any]) -> ConfidenceJudgeResponse:
+    """Ask Qwen to score whether the answer is supported by returned evidence."""
+    content = ollama_chat(
+        [{"role": "user", "content": judge_prompt(response)}],
+        model=LLM_JUDGE_MODEL,
+        format_schema=ConfidenceJudgeResponse.model_json_schema(),
+        options={"temperature": 0},
+        timeout=settings.llm_judge_timeout_seconds,
+    )
+    return ConfidenceJudgeResponse.model_validate_json(content)
+
+
+def deterministic_answer(question: str, tool: str, data: list[dict[str, Any]]) -> str | None:
+    """Return planner-friendly summaries for known deterministic shapes."""
+    if not data:
+        return None
+
+    q = question.lower()
+    if tool == "check_load":
+        if any(term in q for term in ("highest load", "most active queued work")):
+            row = data[0]
+            if "most active queued work" in q:
+                return (
+                    f"{row['machine_id']} has the most active queued work with "
+                    f"{row.get('active_order_count', 0)} active orders and {format_number(row['queued_hours'])} queued hours."
+                )
+            return (
+                f"{row['machine_id']} has the highest load with "
+                f"{format_number(row['queued_hours'])} queued hours and {format_number(row['load_pct'])}% load."
+            )
+        if "unavailable" in q:
+            machines = [
+                f"{row['machine_id']} ({row['machine_name']}) is unavailable with {format_number(row['available_hours_today'])} available hours today"
+                for row in data
+            ]
+            return f"{'; '.join(machines)}."
+        if "partially available" in q or "partial" in q:
+            machines = [
+                f"{row['machine_id']} with {format_one_decimal(row['available_hours_today'])} available hours"
+                for row in sorted(data, key=lambda item: item["machine_id"])
+            ]
+            return f"The partially available machines are {', '.join(machines)}."
+        machines = [
+            f"{row['machine_id']} ({format_number(row['load_pct'])}%)"
+            for row in data
+            if row.get("machine_id") and row.get("load_pct") is not None
+        ]
+        if machines:
+            qualifier = "not overloaded" if "not overloaded" in q else "overloaded" if "overloaded" in q else "highest-load"
+            return f"The {qualifier} machines are {', '.join(machines)}."
+
+    if tool == "get_priority":
+        ids = [str(row["wo_id"]) for row in data if row.get("wo_id")]
+        if ids:
+            priorities = sorted({f"P{row['priority']}" for row in data if row.get("priority")})
+            return f"High-priority orders due in this window are {', '.join(ids)} ({', '.join(priorities)})."
+
+    if tool == "simulate_downtime":
+        row = data[0]
+        affected = row.get("affected_orders", [])
+        ids = [str(order["wo_id"]) for order in affected if order.get("wo_id")]
+        if ids:
+            delayed = [str(order["wo_id"]) for order in affected if order.get("status") == "delayed"]
+            new_risk = [str(order["wo_id"]) for order in affected if order.get("status") != "delayed"]
+            parts = [
+                f"{row['machine_id']} would have {format_number(row['new_available_hours'])} hours left after {format_number(row['downtime_hours'])} extra hours down."
+            ]
+            if new_risk:
+                parts.append(f"Newly affected orders: {', '.join(new_risk)}.")
+            if delayed:
+                parts.append(f"Already delayed orders deepen: {', '.join(delayed)}.")
+            return " ".join(parts)
+
+    actions = [str(row["action"]) for row in data if row.get("action")]
+    if actions:
+        return f"Recommended actions: {'; '.join(actions)}."
+
+    counts = [row for row in data if row.get("status") and row.get("count") is not None]
+    if counts:
+        row = counts[0]
+        label = str(row["status"]).replace("_", "-")
+        return f"{row['count']} {label} work orders."
+
+    work_orders = [str(row["wo_id"]) for row in data if row.get("wo_id")]
+    if work_orders:
+        risk_reasons = [str(row["risk_reason"]) for row in data if row.get("risk_reason")]
+        if risk_reasons:
+            row = data[0]
+            machine = row.get("required_machine")
+            reason = risk_reasons[0]
+            if machine and reason.startswith("Machine unavailable"):
+                return f"{work_orders[0]} is at risk: Machine {machine} is unavailable, so {work_orders[0]} cannot be scheduled."
+            if machine and reason.startswith("Processing time exceeds"):
+                return f"{work_orders[0]} is at risk: it requires {machine}; processing time exceeds available machine hours today."
+            return f"{', '.join(work_orders)} is at risk: {reason}."
+        statuses = [str(row["status"]) for row in data if row.get("status")]
+        machines = [str(row["required_machine"]) for row in data if row.get("required_machine")]
+        if len(work_orders) == 1 and statuses:
+            row = data[0]
+            machine = f", requires {machines[0]}" if machines else ""
+            priority = f", priority P{row['priority']}" if row.get("priority") is not None else ""
+            due = f", due {row['due_date']}" if row.get("due_date") else ""
+            return f"{work_orders[0]} is {statuses[0]}{machine}{priority}{due}."
+        return f"Work orders returned: {', '.join(work_orders)}."
+
+    return None
+
+
+def format_number(value: Any) -> str:
+    """Format numeric values without noisy trailing decimals."""
+    number = Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return str(int(number)) if number == number.to_integral() else f"{number:.1f}"
+
+
+def format_one_decimal(value: Any) -> str:
+    """Format operational hours with one decimal place."""
+    return f"{Decimal(str(value)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP):.1f}"
 
 
 def refuse_response(question: str) -> dict[str, Any]:
@@ -321,7 +629,7 @@ def is_planning_question(question: str) -> bool:
     q = question.lower()
     return any(term in q for term in SCHEDULING_TERMS) or bool(
         # Accept scheduling IDs such as WO-1003 or M4 even without other keywords.
-        re.search(r"\b(?:wo-\d+|m\d+)\b", q)
+        re.search(r"\b(?:wo-\d+|m\d+|\d{4})\b", q)
     )
 
 
@@ -332,12 +640,215 @@ def extract_work_order_id(question: str) -> str | None:
     return match.group(0).upper() if match else None
 
 
+def extract_work_order_ids(question: str) -> list[str]:
+    """Return work-order IDs, including shorthand like 1003 when context implies an order."""
+    ids = {match.upper() for match in re.findall(r"\bWO-\d+\b", question, flags=re.IGNORECASE)}
+    q = question.lower()
+    if any(term in q for term in ("order", "work", "wo", "status", "delayed", "risk", "blocked", "current")):
+        ids.update(f"WO-{number}" for number in re.findall(r"\b(10\d{2})\b", question))
+    return sorted(ids)
+
+
+def first_work_order_id(question: str, extracted: ExtractedQuestion | None = None) -> str | None:
+    """Return the first extracted work-order ID from structured or direct parsing."""
+    if extracted and extracted.work_order_ids:
+        return extracted.work_order_ids[0]
+    ids = extract_work_order_ids(question)
+    return ids[0] if ids else None
+
+
 def is_work_order_risk_question(question: str) -> bool:
     """Return whether a question asks why one work order is at risk."""
     q = question.lower()
-    return extract_work_order_id(question) is not None and any(
+    return first_work_order_id(question) is not None and any(
         term in q for term in ("risk", "why", "blocked")
     )
+
+
+def extract_question(question: str) -> RouterResult:
+    """Extract intent/entities with deterministic rules, then DeepSeek router reasoning."""
+    extracted = deterministic_extract_question(question)
+    if extraction_is_complete(extracted):
+        return RouterResult(extracted=extracted)
+    try:
+        routed = route_question_with_slm(question)
+    except (httpx.HTTPError, ValueError, ValidationError):
+        return RouterResult(extracted=extracted)
+    return RouterResult(
+        extracted=merge_extractions(extracted, routed.extracted),
+        reasoning=routed.reasoning,
+        used_model=routed.used_model,
+    )
+
+
+def deterministic_extract_question(question: str) -> ExtractedQuestion:
+    """Use cheap exact parsing before paying for model inference."""
+    q = question.lower()
+    intent = "unknown"
+    if "recommend" in q or "action" in q or "reduce delay" in q:
+        intent = "recommend_actions"
+    elif "downtime" in q or "down" in q:
+        intent = "simulate_downtime"
+    elif "how many" in q and count_status_from_question(question):
+        intent = "work_order_count"
+    elif "priority" in q or "due this week" in q or "due soon" in q:
+        intent = "priority_orders"
+    elif (
+        "load" in q
+        or "overloaded" in q
+        or "capacity" in q
+        or "queued work" in q
+        or "unavailable" in q
+        or "partially available" in q
+        or "partial" in q
+    ):
+        intent = "machine_load"
+    elif is_work_order_risk_question(question):
+        intent = "work_order_risk"
+    elif first_work_order_id(question) and any(term in q for term in ("status", "current", "progress", "delayed")):
+        intent = "work_order_status"
+    elif "delayed" in q or "delay" in q:
+        intent = "delayed_orders"
+
+    # # Match downtime duration (e.g., "4.5 hours", "12h", "2 extra hrs")
+    hours_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:extra\s+|additional\s+|more\s+)?(?:hours?|hrs?|hr|h)\b",
+        q,
+    )
+    machine_ids = [match.upper() for match in re.findall(r"\bM\d+\b", question, flags=re.IGNORECASE)]
+    priority_max = 2 if re.search(r"\b(?:high.priority|p2|priority\s*2|priority\s*two)\b", q) else None
+    return ExtractedQuestion(
+        intent=intent,
+        work_order_ids=extract_work_order_ids(question),
+        machine_ids=sorted(set(machine_ids)),
+        downtime_hours=float(hours_match.group(1)) if hours_match else None,
+        priority_max=priority_max,
+        due_window_days=7 if "week" in q else None,
+    )
+
+
+def extraction_is_complete(extracted: ExtractedQuestion) -> bool:
+    """Return whether deterministic parsing found enough to route safely."""
+    if extracted.intent in {"unknown", "simulate_downtime"} and not extracted.machine_ids:
+        return False
+    if extracted.intent == "simulate_downtime" and extracted.downtime_hours is None:
+        return False
+    return extracted.intent != "unknown" or bool(extracted.work_order_ids)
+
+
+def merge_extractions(primary: ExtractedQuestion, secondary: ExtractedQuestion) -> ExtractedQuestion:
+    """Prefer deterministic facts, filling gaps from SLM output."""
+    intent = primary.intent if primary.intent != "unknown" else secondary.intent
+    machine_ids = primary.machine_ids
+    if not machine_ids and intent == "simulate_downtime":
+        machine_ids = secondary.machine_ids
+    return ExtractedQuestion(
+        intent=intent,
+        work_order_ids=primary.work_order_ids or secondary.work_order_ids,
+        machine_ids=machine_ids,
+        downtime_hours=primary.downtime_hours if primary.downtime_hours is not None else secondary.downtime_hours,
+        priority_max=primary.priority_max if primary.priority_max is not None else secondary.priority_max,
+        due_window_days=primary.due_window_days if primary.due_window_days is not None else secondary.due_window_days,
+    )
+
+
+def route_question_with_slm(question: str) -> RouterResult:
+    """Ask DeepSeek to reason about routing, then parse its final JSON."""
+    prompt = router_prompt(question, db.get_machine_aliases())
+    content = ollama_chat(
+        [{"role": "user", "content": prompt}],
+        model=LLM_ROUTER_MODEL,
+        options={"temperature": 0},
+        timeout=settings.llm_router_timeout_seconds,
+        include_thinking=True,
+    )
+    return parse_router_response(content)
+
+
+def parse_router_response(content: str) -> RouterResult:
+    """Split DeepSeek <think> reasoning from the final extraction JSON."""
+    think_match = re.search(r"<think>(.*?)</think>", content, flags=re.IGNORECASE | re.DOTALL)
+    reasoning = think_match.group(1).strip() if think_match else ""
+    payload = re.sub(r"<think>.*?</think>", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
+    payload_match = re.search(r"\{.*\}", payload, flags=re.DOTALL)
+    if payload_match is None:
+        raise ValueError("Router response did not include JSON.")
+    extracted = ExtractedQuestion.model_validate_json(payload_match.group(0))
+    return RouterResult(
+        extracted=normalize_extracted(extracted),
+        reasoning=reasoning or ROUTER_FALLBACK_REASONING,
+        used_model=LLM_ROUTER_MODEL,
+    )
+
+
+def normalize_extracted(extracted: ExtractedQuestion) -> ExtractedQuestion:
+    """Normalize IDs returned by the SLM before DB validation."""
+    work_orders = []
+    for value in extracted.work_order_ids:
+        value = str(value).upper()
+        if re.fullmatch(r"\d{4}", value):
+            value = f"WO-{value}"
+        if re.fullmatch(r"WO-\d+", value):
+            work_orders.append(value)
+    machines = [
+        str(value).upper()
+        for value in extracted.machine_ids
+        if re.fullmatch(r"M\d+", str(value), flags=re.IGNORECASE)
+    ]
+    return ExtractedQuestion(
+        intent=extracted.intent,
+        work_order_ids=sorted(set(work_orders)),
+        machine_ids=sorted(set(machines)),
+        downtime_hours=extracted.downtime_hours,
+        priority_max=extracted.priority_max,
+        due_window_days=extracted.due_window_days,
+    )
+
+
+def validate_entities(question: str, extracted: ExtractedQuestion) -> dict[str, Any] | None:
+    """Fail fast when extracted entities do not exist in live data."""
+    for wo_id in extracted.work_order_ids:
+        if not db.work_order_exists(wo_id):
+            return entity_not_found_response(question, f"Work order {wo_id} was not found.")
+    for machine_id in extracted.machine_ids:
+        if not db.machine_exists(machine_id):
+            return entity_not_found_response(question, f"Machine {machine_id} was not found.")
+    return None
+
+
+def count_status_from_question(question: str) -> str | None:
+    """Return a work-order status for simple count questions."""
+    q = question.lower()
+    if "in progress" in q or "in-progress" in q:
+        return "in_progress"
+    if "pending" in q:
+        return "pending"
+    if "completed" in q or "complete" in q:
+        return "completed"
+    if "delayed" in q:
+        return "delayed"
+    if "on hold" in q or "on_hold" in q:
+        return "on_hold"
+    return None
+
+
+def entity_not_found_response(question: str, message: str) -> dict[str, Any]:
+    """Return a deterministic missing-entity answer."""
+    return {
+        "question": question,
+        "tool_used": "refuse",
+        "sql_used": None,
+        "data": [],
+        "answer": message,
+        "explanation": message,
+        "confidence": 0.9,
+        "follow_ups": ["Which work orders are delayed?", "Which machines are overloaded?"],
+    }
+
+
+def route_extracted(question: str, extracted: ExtractedQuestion) -> str:
+    """Route from structured extraction, falling back to keyword routing."""
+    return INTENT_TO_TOOL.get(extracted.intent) or route_tool(question)
 
 
 # some common words
@@ -361,18 +872,14 @@ def generate_sql(question: str) -> tuple[str, tuple[Any, ...]]:
         [
             {
                 "role": "system",
-                "content": (
-                    f"{sql_prompt()}\n"
-                    "Return JSON only. Put the PostgreSQL SELECT statement in query. "
-                    "Use %s placeholders for user-supplied values and put the matching "
-                    "values in params, in order."
-                ),
+                "content": sql_prompt(),
             },
             {"role": "user", "content": question},
         ],
         model=LLM_SQL_MODEL,
         format_schema=SQLResponse.model_json_schema(),
         options={"temperature": 0},
+        timeout=settings.llm_sql_timeout_seconds,
     )
     generated = SQLResponse.model_validate_json(content)
     sql = generated.query.strip()
@@ -410,61 +917,78 @@ def sql_generation_config() -> dict[str, Any]:
     return load_prompt("sql_generation.yaml")
 
 
-def explanation_config() -> dict[str, Any]:
-    """Return Qwen explanation role, rules, and fallback wording."""
-    return load_prompt("explanation.yaml")
+def router_config() -> dict[str, Any]:
+    """Return DeepSeek router role, rules, and few-shot examples."""
+    return load_prompt("router.yaml")
+
+
+def judge_config() -> dict[str, Any]:
+    """Return Qwen confidence judge role and rules."""
+    return load_prompt("judge.yaml")
+
+
+def router_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
+    """Build the reasoning-router prompt from YAML."""
+    config = router_config()
+    return config["template"].format(
+        role=config["agent"]["role"],
+        purpose=config["agent"]["model_purpose"],
+        rules=yaml.safe_dump(config["rules"], sort_keys=False),
+        aliases=json.dumps(aliases, default=str),
+        examples=yaml.safe_dump(config["examples"], sort_keys=False),
+        question=question,
+    )
+
+
+def entity_extraction_config() -> dict[str, Any]:
+    """Backward-compatible alias for the active router prompt config."""
+    return router_config()
+
+
+def entity_extraction_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
+    """Backward-compatible alias for the active router prompt."""
+    return router_prompt(question, aliases)
 
 
 def sql_prompt() -> str:
     """Build the SQL generation prompt from YAML context."""
     sql_config = sql_generation_config()
     context = schema_context()
-    return f"""{sql_config["agent"]["role"]}
+    return sql_config["template"].format(
+        role=sql_config["agent"]["role"],
+        purpose=sql_config["agent"]["model_purpose"],
+        schema=yaml.safe_dump(context["schema"], sort_keys=False),
+        known_values=yaml.safe_dump(context["known_values"], sort_keys=False),
+        business_rules=yaml.safe_dump(context["business_rules"], sort_keys=False),
+        rules=yaml.safe_dump(sql_config["rules"], sort_keys=False),
+        examples=yaml.safe_dump(sql_config.get("examples", []), sort_keys=False),
+    )
 
-Purpose:
-{sql_config["agent"]["model_purpose"]}
 
-Schema context:
-{yaml.safe_dump(context["schema"], sort_keys=False)}
+def judge_prompt(response: dict[str, Any]) -> str:
+    """Build the confidence-judge prompt from YAML."""
+    config = judge_config()
+    evidence = {
+        "question": response.get("question"),
+        "tool_used": response.get("tool_used"),
+        "sql_used": response.get("sql_used"),
+        "data": response.get("data"),
+        "answer": response.get("answer"),
+        "fallback_confidence": response.get("confidence"),
+    }
+    return config["template"].format(
+        role=config["agent"]["role"],
+        purpose=config["agent"]["model_purpose"],
+        rules=yaml.safe_dump(config["rules"], sort_keys=False),
+        rubric=yaml.safe_dump(config["rubric"], sort_keys=False),
+        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
+    )
 
-Known values:
-{yaml.safe_dump(context["known_values"], sort_keys=False)}
-
-Business rules:
-{yaml.safe_dump(context["business_rules"], sort_keys=False)}
-
-Rules:
-{yaml.safe_dump(sql_config["rules"], sort_keys=False)}
-"""
-
-# Uses LLM
-def explain_result(question: str, data: list[dict[str, Any]]) -> str:
-    """Ask the explanation model to explain returned rows, with a deterministic fallback."""
-    config = explanation_config()
+def fallback_answer(data: list[dict[str, Any]]) -> str:
+    """Return a readable answer when a result shape has no custom template."""
     if not data:
-        return config["fallback"]["empty_result"]
+        return "I did not find matching scheduling records for that question."
 
-    payload = json.dumps(data, default=str)
-    rules = yaml.safe_dump(config["rules"], sort_keys=False)
-    prompt = f"""{config["agent"]["role"]}
-
-    Question asked:
-    {question}
-
-    Data returned:
-    {payload}
-
-    Rules:
-    {rules}
-    """
-    try:
-        return ollama_chat([{"role": "user", "content": prompt}], timeout=5, model=LLM_EXPLANATION_MODEL)
-    except httpx.HTTPError:
-        return fallback_explanation(data)
-
-
-def fallback_explanation(data: list[dict[str, Any]]) -> str:
-    """Return a readable summary when the local LLM is unavailable."""
     affected = [
         str(order["wo_id"])
         for row in data
@@ -495,6 +1019,7 @@ def ollama_chat(
     model: str | None = None,
     format_schema: dict[str, Any] | None = None,
     options: dict[str, Any] | None = None,
+    include_thinking: bool = False,
 ) -> str:
     """Call Ollama's chat API."""
     payload: dict[str, Any] = {"model": model or LLM_SQL_MODEL, "messages": messages, "stream": False}
@@ -509,4 +1034,9 @@ def ollama_chat(
         timeout=timeout,
     )
     response.raise_for_status()
-    return response.json()["message"]["content"]
+    message = response.json()["message"]
+    content = message["content"]
+    thinking = message.get("thinking")
+    if include_thinking and thinking:
+        return f"<think>{thinking.strip()}</think>\n{content}"
+    return content
