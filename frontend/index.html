@@ -14,8 +14,9 @@
       --ink: #202123;
       --muted: #6b7280;
       --line: #d9d9e3;
-      --accent: #10a37f;
-      --accent-dark: #0d8f70;
+      --accent: #003a8c;
+      --accent-dark: #002b68;
+      --accent-soft: #e8f0ff;
       --danger: #c2413b;
       --sidebar: #202123;
       --sidebar-ink: #f7f7f8;
@@ -72,21 +73,30 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      min-height: 42px;
+      min-height: 58px;
       font-weight: 720;
       letter-spacing: 0;
     }
 
-    .mark {
+    .brand-logo {
+      width: 112px;
+      height: auto;
+      border-radius: 6px;
+      background: #fff;
+      padding: 5px;
+      display: block;
+    }
+
+    .brand-title {
       display: grid;
-      place-items: center;
-      width: 30px;
-      height: 30px;
-      border: 1px solid rgba(255, 255, 255, 0.25);
-      border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
-      color: #9ff2d6;
-      font-weight: 800;
+      gap: 1px;
+      line-height: 1.2;
+    }
+
+    .brand-title span {
+      color: var(--sidebar-muted);
+      font-size: 12px;
+      font-weight: 650;
     }
 
     .nav,
@@ -120,6 +130,22 @@
       font-weight: 700;
       letter-spacing: 0;
       text-transform: uppercase;
+    }
+
+    .prompt-group {
+      display: grid;
+      gap: 8px;
+    }
+
+    .prompt-group + .prompt-group {
+      margin-top: 12px;
+    }
+
+    .prompt-group h3 {
+      margin: 0 0 7px;
+      color: var(--sidebar-muted);
+      font-size: 12px;
+      font-weight: 650;
     }
 
     .sidebar-foot {
@@ -222,6 +248,12 @@
       padding: 4px 9px;
       font-size: 12px;
       font-weight: 650;
+    }
+
+    .stack .pill {
+      border-color: #c7d7f5;
+      background: var(--accent-soft);
+      color: var(--accent);
     }
 
     .suggestions {
@@ -359,18 +391,34 @@
         padding: 12px;
       }
 
-      .nav,
-      .examples {
+      .nav {
         display: flex;
         overflow-x: auto;
         padding-bottom: 2px;
       }
 
-      .nav a,
-      .examples button {
+      .examples {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+
+      .nav a {
         flex: 0 0 auto;
         width: auto;
         white-space: nowrap;
+      }
+
+      .examples button {
+        width: 100%;
+        white-space: normal;
+      }
+
+      .prompt-group {
+        min-width: 0;
+      }
+
+      .prompt-group h3 {
+        display: block;
       }
 
       .sidebar-foot {
@@ -400,8 +448,11 @@
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <div class="mark">AI</div>
-        <div>Planning Copilot</div>
+        <img class="brand-logo" src="/ui/assets/a-star-logo.png" alt="A*STAR ARTC">
+        <div class="brand-title">
+          <div>AI Planning Copilot</div>
+          <span>Shop floor scheduling</span>
+        </div>
       </div>
 
       <nav class="nav" aria-label="API links">
@@ -414,12 +465,21 @@
       <div>
         <h2>Assessment prompts</h2>
         <div class="examples" aria-label="Assessment prompts">
-          <button type="button" data-question="Which work orders are delayed?">Delayed work orders</button>
-          <button type="button" data-question="Which machines are overloaded?">Overloaded machines</button>
-          <button type="button" data-question="Why is WO-1003 at risk?">Why WO-1003 is at risk</button>
-          <button type="button" data-question="What happens if M2 is down for 4 extra hours?">M2 down 4 hours</button>
-          <button type="button" data-question="Show high-priority orders due this week.">High priority due soon</button>
-          <button type="button" data-question="Recommend actions to reduce delays.">Recommended actions</button>
+          <div class="prompt-group">
+            <h3>Delays and risk</h3>
+            <button type="button" data-question="Which work orders are delayed?">Delayed work orders</button>
+            <button type="button" data-question="Why is WO-1003 at risk?">Why WO-1003 is at risk</button>
+          </div>
+          <div class="prompt-group">
+            <h3>Load and priority</h3>
+            <button type="button" data-question="Which machines are overloaded?">Overloaded machines</button>
+            <button type="button" data-question="Show high-priority orders due this week.">High priority due soon</button>
+          </div>
+          <div class="prompt-group">
+            <h3>Simulation and actions</h3>
+            <button type="button" data-question="What happens if M2 is down for 4 extra hours?">M2 down 4 hours</button>
+            <button type="button" data-question="Recommend actions to reduce delays.">Recommended actions</button>
+          </div>
         </div>
       </div>
 
@@ -437,12 +497,20 @@
           <div class="avatar">AI</div>
           <div class="bubble">
             <div class="message-title">Planning Copilot</div>
-            <p>Ask about work orders, machine load, downtime, priority, risk, or recommended actions.</p>
+            <p>Ask scheduling questions about delays, machine load, priority, downtime, risk, and recommended actions.</p>
+            <div class="summary stack" aria-label="Application stack">
+              <span class="pill">FastAPI</span>
+              <span class="pill">PostgreSQL</span>
+              <span class="pill">Ollama/Qwen</span>
+              <span class="pill">Read-only SQL</span>
+            </div>
             <div class="suggestions">
               <button type="button" data-question="Which work orders are delayed?">Which work orders are delayed?</button>
               <button type="button" data-question="Which machines are overloaded?">Which machines are overloaded?</button>
               <button type="button" data-question="Why is WO-1003 at risk?">Why is WO-1003 at risk?</button>
               <button type="button" data-question="What happens if M2 is down for 4 extra hours?">What happens if M2 is down for 4 extra hours?</button>
+              <button type="button" data-question="Show high-priority orders due this week.">Show high-priority orders due this week.</button>
+              <button type="button" data-question="Recommend actions to reduce delays.">Recommend actions to reduce delays.</button>
             </div>
           </div>
         </article>
