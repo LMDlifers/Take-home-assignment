@@ -102,16 +102,6 @@ def is_safe_select(sql: str) -> bool:
     )
 
 
-def get_machine_loads() -> list[dict[str, Any]]:
-    """Return all machine load rows from the seeded view."""
-    return fetch_all(MACHINE_LOAD_SQL)
-
-
-def get_at_risk_orders() -> list[dict[str, Any]]:
-    """Return at-risk work orders from the seeded view."""
-    return fetch_all(AT_RISK_ORDERS_SQL)
-
-
 def get_at_risk_order(wo_id: str) -> list[dict[str, Any]]:
     """Return one at-risk work order from the seeded view."""
     return fetch_all(AT_RISK_ORDER_SQL, (wo_id,))
@@ -141,11 +131,6 @@ def get_machine_aliases() -> list[dict[str, str]]:
         ORDER BY machine_id ASC
         """
     )
-
-
-def get_priority_queue() -> list[dict[str, Any]]:
-    """Return due-soon work orders from the seeded priority view."""
-    return fetch_all(PRIORITY_QUEUE_SQL)
 
 
 def get_machines() -> list[dict[str, Any]]:
@@ -215,21 +200,6 @@ def get_machine(machine_id: str) -> dict[str, Any] | None:
         (machine_id,),
     )
     return rows[0] if rows else None
-
-
-def get_active_orders_for_machine(machine_id: str) -> list[dict[str, Any]]:
-    """Return pending or in-progress orders assigned to one machine."""
-    return fetch_all(
-        """
-        SELECT wo_id, product_code, required_machine, processing_time_hr,
-               priority, due_date, status
-        FROM work_orders
-        WHERE required_machine = %s
-          AND status IN ('pending', 'in_progress')
-        ORDER BY priority ASC, due_date ASC, wo_id ASC
-        """,
-        (machine_id,),
-    )
 
 
 def get_orders_for_simulation(machine_id: str) -> list[dict[str, Any]]:

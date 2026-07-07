@@ -20,16 +20,6 @@ def load_status(load_pct: float) -> str:
     return "normal" #Anything 85% or below is considered normal.
 
 
-def add_load_status(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach load_status to machine load rows."""
-    labelled = []
-    for row in rows:
-        item = dict(row)
-        item["load_status"] = load_status(float(item["load_pct"] or 0))
-        labelled.append(item)
-    return labelled
-
-
 def calculate_machine_loads(
     machines: list[dict[str, Any]],
     orders: list[dict[str, Any]],

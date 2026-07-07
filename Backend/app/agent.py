@@ -5,7 +5,6 @@ reasoning, routes to the right tool, and logs each action for auditability.
 """
 
 import json
-import math
 import re
 import uuid
 from decimal import Decimal
@@ -13,7 +12,6 @@ from decimal import ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from typing import Literal
 
 import httpx
 import psycopg
@@ -30,14 +28,15 @@ from app.config import settings
 OLLAMA_BASE_URL = settings.ollama_base_url
 LLM_ROUTER_MODEL = settings.llm_router_model
 LLM_SQL_MODEL = settings.llm_sql_model
-LLM_JUDGE_MODEL = settings.llm_judge_model
-LLM_ANSWER_MODEL = settings.llm_answer_model
 LLM_EXPLANATION_MODEL = settings.llm_explanation_model
-ROUTER_FALLBACK_REASONING = "DeepSeek router reasoning was unavailable; deterministic parsing routed this request."
-JUDGE_FALLBACK_REASON = "Judge unavailable; kept deterministic fallback confidence."
-EMCS_ENTROPY_WEIGHT = settings.emcs_entropy_weight
+ROUTER_FALLBACK_REASONING = "Router reasoning was unavailable; deterministic parsing routed this request."
 ALLOWED_TOOLS = {"run_sql", "check_load", "simulate_downtime", "get_priority", "recommend", "refuse", "count_orders"}
 DEFAULT_FOLLOW_UPS = ["Which machines are causing the most delays?", "Show high-priority orders due this week."]
+CONFIDENCE_BY_SOURCE = {
+    "deterministic": 0.92,
+    "fixed_sql": 0.92,
+    "generated_sql": 0.75,
+}
 
 
 class SQLResponse(BaseModel):
@@ -71,18 +70,6 @@ class RouterResult(BaseModel):
     extracted: ExtractedQuestion
     reasoning: str = ROUTER_FALLBACK_REASONING
     used_model: str | None = None
-
-
-class ConfidenceJudgeResponse(BaseModel):
-    """Structured answer-support score from the judge model."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    value_estimate: float = Field(ge=0.0, le=1.0)
-    confidence_score: float = Field(ge=0.0, le=1.0)
-    verdict: Literal["supported", "partially_supported", "unsupported", "not_applicable"]
-    reason: str
-    issues: list[str] = Field(default_factory=list)
 
 
 SCHEDULING_TERMS = {
@@ -135,7 +122,7 @@ def answer_question(question: str) -> dict[str, Any]:
     )
     if not extracted.in_scope or route_extracted(question, extracted) == "refuse":
         response = refuse_response(question)
-        skip_confidence_judge(trace, "Out-of-scope refusal is deterministic.")
+        skip_confidence(trace, "Out-of-scope refusal is deterministic.")
         attach_trace(response, trace)
         safe_log_action(session_id, response)
         return response
@@ -143,7 +130,7 @@ def answer_question(question: str) -> dict[str, Any]:
     validation_response = validate_entities(question, extracted)
     if validation_response is not None:
         trace.append({"step": "entity_validation", "status": "failed", "message": validation_response["answer"]})
-        skip_confidence_judge(trace, "Entity validation failure is deterministic.")
+        skip_confidence(trace, "Entity validation failure is deterministic.")
         attach_trace(validation_response, trace)
         safe_log_action(session_id, validation_response)
         return validation_response
@@ -164,7 +151,7 @@ def answer_question(question: str) -> dict[str, Any]:
     else:
         response = run_sql_tool(question, tool)
 
-    apply_confidence_judge(response, trace)
+    apply_confidence(response, trace)
     attach_trace(response, trace)
     safe_log_action(session_id, response)
     return response
@@ -187,7 +174,7 @@ def run_sql_tool(question: str, tool: str = "run_sql") -> dict[str, Any]:
         data = db.fetch_all(sql, params)
     except (ValueError, psycopg.Error) as error:
         return sql_error_response(question, tool, sql, f"The generated query could not be executed safely: {error}")
-    return answer_from_data(question, tool, sql, data, confidence_source="llm")
+    return answer_from_data(question, tool, sql, data, confidence_source="generated_sql")
 
 
 def check_load_tool(question: str) -> dict[str, Any]:
@@ -281,21 +268,6 @@ def recommend_tool(question: str) -> dict[str, Any]:
     return answer_from_data(question, "recommend", None, data, confidence=0.8)
 
 
-def delayed_orders_tool(question: str) -> dict[str, Any]:
-    """Return delayed work orders from a fixed read query."""
-    sql = """
-SELECT wo_id, status, due_date, required_machine, priority
-FROM work_orders
-WHERE status = 'delayed'
-ORDER BY wo_id ASC
-"""
-    try:
-        data = db.fetch_all(sql)
-    except (ValueError, psycopg.Error) as error:
-        return sql_error_response(question, "run_sql", sql.strip(), f"The fixed delayed-orders query failed safely: {error}")
-    return answer_from_data(question, "run_sql", sql.strip(), data, confidence_source="fixed_sql")
-
-
 def count_orders_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
     """Answer simple work-order status count questions without generated SQL."""
     status = count_status_from_question(question)
@@ -304,25 +276,6 @@ def count_orders_tool(question: str, extracted: ExtractedQuestion) -> dict[str, 
     sql = "SELECT status, COUNT(*)::int AS count FROM work_orders WHERE status = %s GROUP BY status"
     data = db.fetch_all(sql, (status,)) or [{"status": status, "count": 0}]
     return answer_from_data(question, "run_sql", sql, data, confidence_source="fixed_sql")
-
-
-def work_order_status_tool(question: str, extracted: ExtractedQuestion) -> dict[str, Any]:
-    """Answer direct work-order status questions from a fixed status query."""
-    wo_id = first_work_order_id(question, extracted)
-    if wo_id is None:
-        return run_sql_tool(question)
-    data = db.get_work_order_status(wo_id)
-    return answer_from_data(question, "run_sql", db.WORK_ORDER_STATUS_SQL.strip(), data, confidence_source="fixed_sql")
-
-
-def work_order_risk_tool(question: str, extracted: ExtractedQuestion | None = None) -> dict[str, Any]:
-    """Answer direct work-order risk questions from the seeded risk view."""
-    wo_id = first_work_order_id(question, extracted)
-    if wo_id is None:
-        return run_sql_tool(question)
-
-    data = db.get_at_risk_order(wo_id)
-    return answer_from_data(question, "run_sql", db.AT_RISK_ORDER_SQL.strip(), data, confidence_source="fixed_sql")
 
 
 def answer_from_data(
@@ -337,15 +290,9 @@ def answer_from_data(
     draft = deterministic_answer(question, tool, data) or fallback_answer(data)
     answer = draft
     answer_generation = {
-        "source": "fallback",
-        "model": LLM_ANSWER_MODEL,
+        "source": "deterministic",
         "draft": draft,
     }
-    try:
-        answer = freestyle_answer(question, tool, sql, data, draft)
-        answer_generation["source"] = "llm"
-    except (httpx.HTTPError, ValueError, KeyError, TypeError):
-        answer_generation["reason"] = "Answer model unavailable; kept deterministic draft."
     explanation = draft
     explanation_generation = {
         "source": "fallback",
@@ -385,7 +332,7 @@ def attach_trace(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
                 "step": "answer_generation",
                 "answer": response.get("answer"),
                 **response.pop("_answer_generation", {"source": "deterministic"}),
-                "note": "Answer is LLM-written from retrieved evidence when available.",
+                "note": "Answer is deterministic so required IDs, statuses, and actions stay intact.",
             },
             {
                 "step": "explanation_generation",
@@ -399,36 +346,18 @@ def attach_trace(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
     response["trace"] = trace
 
 
-def skip_confidence_judge(trace: list[dict[str, Any]], reason: str) -> None:
-    """Record that confidence stayed deterministic."""
-    trace.append({"step": "confidence_judge", "status": "skipped", "reason": reason})
+def skip_confidence(trace: list[dict[str, Any]], reason: str) -> None:
+    """Record that confidence stayed at the response default."""
+    trace.append({"step": "confidence", "status": "skipped", "reason": reason})
 
 
-def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
-    """Calibrate response confidence with deterministic or LLM EMCS."""
+def apply_confidence(response: dict[str, Any], trace: list[dict[str, Any]]) -> None:
+    """Set simple source-based confidence."""
     source = response.pop("_confidence_source", "deterministic")
-    if source in {"deterministic", "fixed_sql"}:
-        value_estimate = 0.92 if source == "fixed_sql" else 0.95
-        confidence_score = 0.95
-        calibration = emcs_calibration(value_estimate, confidence_score)
-        response["confidence"] = calibration["emcs_score"]
-        trace.append(
-            {
-                "step": "confidence_judge",
-                "status": "ok",
-                "source": "deterministic",
-                **calibration,
-                "verdict": "supported",
-                "reason": "Deterministic evidence path; EMCS calibrated without calling the judge model.",
-                "issues": [],
-            }
-        )
-        return
-
     if source == "fallback":
         trace.append(
             {
-                "step": "confidence_judge",
+                "step": "confidence",
                 "status": "fallback",
                 "source": "fallback",
                 "reason": "Fallback response kept its existing confidence.",
@@ -437,89 +366,15 @@ def apply_confidence_judge(response: dict[str, Any], trace: list[dict[str, Any]]
         )
         return
 
-    try:
-        judged = judge_confidence(response)
-    except (httpx.HTTPError, ValueError, ValidationError, KeyError, TypeError):
-        trace.append(
-            {
-                "step": "confidence_judge",
-                "status": "fallback",
-                "source": "fallback",
-                "model": LLM_JUDGE_MODEL,
-                "reason": JUDGE_FALLBACK_REASON,
-                "score": response.get("confidence"),
-            }
-        )
-        return
-
-    calibration = emcs_calibration(judged.value_estimate, judged.confidence_score)
-    response["confidence"] = calibration["emcs_score"]
+    response["confidence"] = CONFIDENCE_BY_SOURCE.get(source, response.get("confidence", 0.75))
     trace.append(
         {
-            "step": "confidence_judge",
+            "step": "confidence",
             "status": "ok",
-            "source": "llm",
-            "model": LLM_JUDGE_MODEL,
-            **calibration,
-            "verdict": judged.verdict,
-            "reason": judged.reason,
-            "issues": judged.issues,
+            "source": source,
+            "score": response["confidence"],
         }
     )
-
-
-def clamp_unit(value: float) -> float:
-    """Clamp a score into the public 0..1 range."""
-    return min(max(float(value), 0.0), 1.0)
-
-
-def clamp_probability(value: float) -> float:
-    """Clamp probability away from exact edges for entropy math."""
-    return min(max(float(value), 1e-9), 1 - 1e-9)
-
-
-def bernoulli_entropy(confidence_score: float) -> float:
-    """Return Bernoulli entropy for evaluator confidence."""
-    confidence = clamp_probability(confidence_score)
-    return -(confidence * math.log(confidence) + (1 - confidence) * math.log(1 - confidence))
-
-
-def emcs_calibration(
-    value_estimate: float,
-    confidence_score: float,
-    entropy_weight: float = EMCS_ENTROPY_WEIGHT,
-) -> dict[str, float]:
-    """Return EMCS-calibrated confidence fields."""
-    value = clamp_unit(value_estimate)
-    confidence = clamp_unit(confidence_score)
-    entropy = bernoulli_entropy(confidence)
-    entropy_norm = entropy / math.log(2)
-    emcs_score = value * (1 - entropy_weight * entropy_norm)
-    emcs_score = clamp_unit(emcs_score)
-    return {
-        "value_estimate": round(value, 4),
-        "confidence_score": round(confidence, 4),
-        "entropy": round(entropy, 4),
-        "entropy_norm": round(entropy_norm, 4),
-        "entropy_weight": round(entropy_weight, 4),
-        "emcs_score": round(emcs_score, 4),
-        "score": round(emcs_score, 4),
-    }
-
-
-def judge_confidence(response: dict[str, Any]) -> ConfidenceJudgeResponse:
-    """Ask Qwen to score whether the answer is supported by returned evidence."""
-    content = ollama_chat(
-        [{"role": "user", "content": judge_prompt(response)}],
-        model=LLM_JUDGE_MODEL,
-        format_schema=ConfidenceJudgeResponse.model_json_schema(),
-        options={
-            "temperature": settings.llm_judge_temperature,
-            "num_predict": settings.llm_judge_num_predict,
-        },
-        timeout=settings.llm_judge_timeout_seconds,
-    )
-    return ConfidenceJudgeResponse.model_validate_json(content)
 
 
 def deterministic_answer(question: str, tool: str, data: list[dict[str, Any]]) -> str | None:
@@ -744,13 +599,6 @@ def is_planning_question(question: str) -> bool:
     )
 
 
-def extract_work_order_id(question: str) -> str | None:
-    """Return a work-order ID token such as WO-1003, if present."""
-    # Extract direct scheduling IDs like WO-1003 from a user question.
-    match = re.search(r"\bWO-\d+\b", question, flags=re.IGNORECASE)
-    return match.group(0).upper() if match else None
-
-
 def extract_work_order_ids(question: str) -> list[str]:
     """Return work-order IDs, including shorthand like 1003 when context implies an order."""
     ids = {match.upper() for match in re.findall(r"\bWO-\d+\b", question, flags=re.IGNORECASE)}
@@ -777,7 +625,7 @@ def is_work_order_risk_question(question: str) -> bool:
 
 
 def extract_question(question: str) -> RouterResult:
-    """Plan with DeepSeek first, using deterministic parsing for trusted facts."""
+    """Plan with the router model, using deterministic parsing for trusted facts."""
     deterministic = deterministic_extract_question(question)
     try:
         routed = route_question_with_slm(question)
@@ -866,7 +714,7 @@ def merge_extractions(primary: ExtractedQuestion, secondary: ExtractedQuestion) 
 
 
 def route_question_with_slm(question: str) -> RouterResult:
-    """Ask DeepSeek to reason about routing, then parse its final JSON."""
+    """Ask the router model to route, then parse its final JSON."""
     prompt = router_prompt(question, db.get_machine_aliases())
     content = ollama_chat(
         [{"role": "user", "content": prompt}],
@@ -881,7 +729,7 @@ def route_question_with_slm(question: str) -> RouterResult:
 
 
 def parse_router_response(content: str) -> RouterResult:
-    """Split DeepSeek <think> reasoning from the final extraction JSON."""
+    """Split optional <think> reasoning from the final extraction JSON."""
     think_match = re.search(r"<think>(.*?)</think>", content, flags=re.IGNORECASE | re.DOTALL)
     reasoning = think_match.group(1).strip() if think_match else ""
     payload = re.sub(r"<think>.*?</think>", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
@@ -1041,18 +889,8 @@ def sql_generation_config() -> dict[str, Any]:
 
 
 def router_config() -> dict[str, Any]:
-    """Return DeepSeek router role, rules, and few-shot examples."""
+    """Return router role, rules, and few-shot examples."""
     return load_prompt("router.yaml")
-
-
-def judge_config() -> dict[str, Any]:
-    """Return Qwen confidence judge role and rules."""
-    return load_prompt("judge.yaml")
-
-
-def answer_config() -> dict[str, Any]:
-    """Return Qwen grounded answer-writing role and rules."""
-    return load_prompt("answer.yaml")
 
 
 def explanation_config() -> dict[str, Any]:
@@ -1073,16 +911,6 @@ def router_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
     )
 
 
-def entity_extraction_config() -> dict[str, Any]:
-    """Backward-compatible alias for the active router prompt config."""
-    return router_config()
-
-
-def entity_extraction_prompt(question: str, aliases: list[dict[str, Any]]) -> str:
-    """Backward-compatible alias for the active router prompt."""
-    return router_prompt(question, aliases)
-
-
 def sql_prompt() -> str:
     """Build the SQL generation prompt from YAML context."""
     sql_config = sql_generation_config()
@@ -1095,45 +923,6 @@ def sql_prompt() -> str:
         business_rules=yaml.safe_dump(context["business_rules"], sort_keys=False),
         rules=yaml.safe_dump(sql_config["rules"], sort_keys=False),
         examples=yaml.safe_dump(sql_config.get("examples", []), sort_keys=False),
-    )
-
-
-def judge_prompt(response: dict[str, Any]) -> str:
-    """Build the confidence-judge prompt from YAML."""
-    config = judge_config()
-    evidence = {
-        "question": response.get("question"),
-        "tool_used": response.get("tool_used"),
-        "sql_used": response.get("sql_used"),
-        "data": response.get("data"),
-        "answer": response.get("answer"),
-        "fallback_confidence": response.get("confidence"),
-    }
-    return config["template"].format(
-        role=config["agent"]["role"],
-        purpose=config["agent"]["model_purpose"],
-        rules=yaml.safe_dump(config["rules"], sort_keys=False),
-        value_rubric=yaml.safe_dump(config["value_rubric"], sort_keys=False),
-        confidence_rubric=yaml.safe_dump(config["confidence_rubric"], sort_keys=False),
-        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
-    )
-
-
-def answer_prompt(question: str, tool: str, sql: str | None, data: list[dict[str, Any]], draft: str) -> str:
-    """Build the grounded freestyle answer prompt from YAML."""
-    config = answer_config()
-    evidence = {
-        "question": question,
-        "tool_used": tool,
-        "sql_used": sql,
-        "data": data,
-    }
-    return config["template"].format(
-        role=config["agent"]["role"],
-        purpose=config["agent"]["model_purpose"],
-        rules=yaml.safe_dump(config["rules"], sort_keys=False),
-        draft=draft,
-        evidence=json.dumps(evidence, default=str, ensure_ascii=True),
     )
 
 
@@ -1163,22 +952,6 @@ def explanation_prompt(
         business_rules=yaml.safe_dump(context["business_rules"], sort_keys=False),
         evidence=json.dumps(evidence, default=str, ensure_ascii=True),
     )
-
-
-def freestyle_answer(question: str, tool: str, sql: str | None, data: list[dict[str, Any]], draft: str) -> str:
-    """Ask Qwen to write the final answer using only returned evidence."""
-    content = ollama_chat(
-        [{"role": "user", "content": answer_prompt(question, tool, sql, data, draft)}],
-        model=LLM_ANSWER_MODEL,
-        options={
-            "temperature": settings.llm_answer_temperature,
-            "num_predict": settings.llm_answer_num_predict,
-        },
-        timeout=settings.llm_answer_timeout_seconds,
-    ).strip()
-    if not content:
-        raise ValueError("Answer model returned empty content.")
-    return content
 
 
 def explain_result(

@@ -31,10 +31,10 @@ def frontend_dir() -> Path:
     """Return the frontend folder in local dev or inside the Docker image."""
     main_file = Path(__file__).resolve()
     for base in (main_file.parents[2], main_file.parents[1]):
-        candidate = base / "Frontend"
+        candidate = base / "frontend"
         if candidate.exists():
             return candidate
-    return main_file.parents[1] / "Frontend"
+    return main_file.parents[1] / "frontend"
 
 
 FRONTEND_DIR = frontend_dir()
