@@ -1,187 +1,99 @@
 # AI Planning Copilot for Shop Floor Scheduling
 
-FastAPI project for the A*Star take-home assignment, with a tiny plain HTML
-test UI served by the API.
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Ollama](https://img.shields.io/badge/Ollama-000000?logo=ollama&logoColor=white)](https://ollama.com/)
 
-Current status: deterministic backend endpoints and the `/api/v1/ask` tool
-router are implemented. The app can be containerised with PostgreSQL and
-Ollama, query seeded scheduling data, run deterministic scheduling tools, and
-use Qwen to generate read-only SQL for open-ended SQL questions.
+A FastAPI-based planning copilot for shop-floor scheduling. It answers natural
+language questions by combining deterministic scheduling logic, PostgreSQL
+queries, prompt-guided SQL generation, and local Qwen explanations through
+Ollama.
 
-## What Exists So Far
+The main interface is `POST /api/v1/ask`. The project also exposes deterministic
+endpoints for machine load, at-risk orders, downtime simulation, and health
+checks.
 
-- FastAPI backend under `Backend/app/`
-- PostgreSQL seed data in `Data/seed.sql`
-- Docker Compose setup for:
-  - `api` - FastAPI service
-  - `db` - PostgreSQL database
-  - `ollama` - local LLM service using `qwen2.5:3b`
-- Health endpoint:
-  - `GET /api/v1/health`
-- Deterministic scheduling endpoints:
-  - `GET /api/v1/machines/load`
-  - `GET /api/v1/orders/at-risk`
-  - `POST /api/v1/simulate/downtime`
-- GenAI endpoint:
-  - `POST /api/v1/ask`
-- Test UI:
-  - `GET /ui/`
-- Basic health tests in `Backend/tests/`
+## Quick Start
 
-`/api/v1/ask` routes questions to simple tools:
-
-- `run_sql` - Qwen generates one safe PostgreSQL `SELECT` query.
-- `check_load` - deterministic Python load calculation from machine and order rows.
-- `get_priority` - deterministic Python priority filtering from live order rows.
-- `simulate_downtime` - deterministic Python simulation after reading machine/order data.
-- `recommend` - deterministic recommendations from load and risk data.
-- `refuse` - out-of-scope questions.
-
-Qwen is used for SQL generation only in the `run_sql` path. Other tools use
-deterministic code first, then Qwen may explain the returned data. If Qwen is
-unavailable during explanation, the API returns a simple fallback summary.
-Each `/api/v1/ask` request writes a best-effort audit row to `agent_action_log`.
-
-## Project Structure
-
-```text
-Take-home-assignment/
-  docker-compose.yml
-  requirements.txt
-  Data/
-    seed.sql
-  frontend/
-    index.html
-  Backend/
-    Dockerfile
-    app/
-      main.py
-      db.py
-      agent.py
-      logic.py
-      schemas.py
-    prompts/
-      schema_context.yaml
-      sql_generation.yaml
-      explanation.yaml
-    tests/
-      conftest.py
-      test_health.py
-      test_logic.py
-      test_routes.py
-      test_agent.py
-      test_db.py
-```
-
-## Run With Docker
+> [!IMPORTANT]
+> First startup can take several minutes because Docker pulls the Ollama image
+> and the `qwen2.5:3b` model.
 
 From the project root:
-
-```powershell
-docker-compose up --build
-```
-
-If your Docker version uses the newer command style:
 
 ```powershell
 docker compose up --build
 ```
 
-The API should be available at:
-
-```text
-http://localhost:8000
-```
-
-Swagger docs:
-
-```text
-http://localhost:8000/docs
-```
-
-Plain HTML test UI:
-
-```text
-http://localhost:8000/ui/
-```
-
-On the same Wi-Fi/LAN, another user can open the UI with your machine's IP:
-
-```text
-http://<your-mac-lan-ip>:8000/ui/
-```
-
-## Health Check
+If your Docker version uses the older command style:
 
 ```powershell
-curl http://localhost:8000/api/v1/health
+docker-compose up --build
 ```
 
-Expected response when the API and database are both reachable:
-
-```json
-{"status":"ok","db":"ok"}
-```
-
-If the API is running but PostgreSQL is unavailable:
-
-```json
-{"status":"degraded","db":"error"}
-```
-
-## Day 2 Endpoints
-
-Machine load:
-
-```powershell
-curl http://localhost:8000/api/v1/machines/load
-```
-
-At-risk orders:
-
-```powershell
-curl http://localhost:8000/api/v1/orders/at-risk
-```
-
-Downtime simulation:
-
-```powershell
-curl -X POST http://localhost:8000/api/v1/simulate/downtime -H "Content-Type: application/json" -d "{\"machine_id\":\"M2\",\"downtime_hours\":4}"
-```
-
-In PowerShell, `curl` is often an alias for `Invoke-WebRequest`. This version
-avoids the header parsing issue:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/simulate/downtime" -ContentType "application/json" -Body '{"machine_id":"M2","downtime_hours":4}'
-```
-
-## Database Seed Check
-
-After the containers are running:
-
-```powershell
-docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT COUNT(*) FROM work_orders;"
-```
-
-The count should be greater than `0`.
-
-## Local LLM Model
-
-Docker Compose pulls the configured model automatically through the
-`ollama-pull` service:
-
-```text
-qwen2.5:3b
-```
-
-If the first startup is interrupted, this troubleshooting command is safe to run:
+If the model pull is interrupted, rerun:
 
 ```powershell
 docker exec -it scheduling_ollama ollama pull qwen2.5:3b
 ```
 
-Test `/ask`:
+## Access Points
+
+| Use | URL |
+| --- | --- |
+| Web UI | `http://localhost:8000/ui/` |
+| Swagger docs | `http://localhost:8000/docs` |
+| Health check | `http://localhost:8000/api/v1/health` |
+| API root | `http://localhost:8000` |
+
+On the same Wi-Fi/LAN, another user can open the UI with your machine's IP:
+
+```text
+http://<your-lan-ip>:8000/ui/
+```
+
+## Design Diagrams
+
+### Architecture
+
+![Architecture flowchart](Documents/Architecture-preview.png)
+
+[Open Architecture PDF](Documents/Architecture.pdf)
+
+### Database
+
+![Database flowchart](Documents/DB.drawio-preview.png)
+
+[Open Database PDF](Documents/DB.drawio.pdf)
+
+## API Reference
+
+| Method | Endpoint | Purpose | Example |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/health` | Check API and database status. | `curl http://localhost:8000/api/v1/health` |
+| `GET` | `/api/v1/machines/load` | Return computed machine load and overload status. | `curl http://localhost:8000/api/v1/machines/load` |
+| `GET` | `/api/v1/orders/at-risk` | Return delayed or at-risk work orders. | `curl http://localhost:8000/api/v1/orders/at-risk` |
+| `POST` | `/api/v1/simulate/downtime` | Simulate extra downtime for a machine. | See details below. |
+| `POST` | `/api/v1/ask` | Ask a natural language scheduling question. | See details below. |
+
+<details>
+<summary>Downtime simulation request</summary>
+
+```powershell
+curl -X POST http://localhost:8000/api/v1/simulate/downtime -H "Content-Type: application/json" -d "{\"machine_id\":\"M2\",\"downtime_hours\":4}"
+```
+
+PowerShell-safe version:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/simulate/downtime" -ContentType "application/json" -Body '{"machine_id":"M2","downtime_hours":4}'
+```
+
+</details>
+
+<details>
+<summary>Natural language ask request</summary>
 
 ```powershell
 curl -X POST http://localhost:8000/api/v1/ask -H "Content-Type: application/json" -d "{\"question\":\"Which work orders are delayed?\"}"
@@ -192,6 +104,10 @@ PowerShell-safe version:
 ```powershell
 Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/ask" -ContentType "application/json" -Body '{"question":"Which machines are overloaded?"}'
 ```
+
+</details>
+
+## Ask Endpoint Examples
 
 Useful assessment questions:
 
@@ -204,7 +120,7 @@ Show high-priority orders due this week.
 Recommend actions to reduce delays.
 ```
 
-Example `/api/v1/ask` response:
+Example response:
 
 ```json
 {
@@ -222,28 +138,6 @@ Example `/api/v1/ask` response:
       "queued_hours": 19.0,
       "load_pct": 190.0,
       "load_status": "overloaded"
-    },
-    {
-      "machine_id": "M6",
-      "machine_name": "Vertical Milling Machine 1",
-      "machine_type": "Mill",
-      "capacity_hours_day": 6.0,
-      "available_hours_today": 6.0,
-      "current_status": "available",
-      "queued_hours": 7.5,
-      "load_pct": 125.0,
-      "load_status": "overloaded"
-    },
-    {
-      "machine_id": "M5",
-      "machine_name": "Laser Cutter 500W",
-      "machine_type": "Laser",
-      "capacity_hours_day": 7.5,
-      "available_hours_today": 7.5,
-      "current_status": "available",
-      "queued_hours": 8.0,
-      "load_pct": 106.7,
-      "load_status": "overloaded"
     }
   ],
   "answer": "Machines returned: M3, M6, M5.",
@@ -256,67 +150,60 @@ Example `/api/v1/ask` response:
 }
 ```
 
-## Audit Logging
-
-`/api/v1/ask` writes one audit row after each response is built. The log records:
-
-- `session_id`
-- `action_type`
-- `input_question`
-- `sql_generated`
-- `result_summary`
-- `confidence`
-
-Logging is best-effort. If the audit insert fails, the API still returns the
-normal response.
-
-Inspect recent logs:
-
-```powershell
-docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT action_type, input_question, sql_generated, result_summary, confidence, created_at FROM agent_action_log ORDER BY created_at DESC LIMIT 5;"
-```
-
-## Prompt Templates
-
-Prompt templates live in:
+## Project Structure
 
 ```text
-Backend/prompts/
+Take-home-assignment/
+  docker-compose.yml        # API, PostgreSQL, Ollama, model pull service
+  requirements.txt          # Python dependencies
+  Data/seed.sql             # Seed schema, views, and scheduling data
+  Documents/                # Architecture and database diagrams
+  frontend/index.html       # Plain HTML test UI
+  Backend/app/              # FastAPI app, agent, DB access, business logic
+  Backend/prompts/          # YAML prompt context for Qwen
+  Backend/tests/            # Unit and API tests
 ```
 
-- `schema_context.yaml` contains table meanings, known values, views, and business rules.
-- `sql_generation.yaml` contains Qwen SQL-generation role and safety instructions.
-- `explanation.yaml` contains Qwen explanation style and fallback wording.
+## Testing
 
-The YAML files guide Qwen only. SQL execution safety is still enforced in Python
-by `db.is_safe_select()`.
-
-Blueprint configuration notes:
-
-- Prompt context node: loads `schema_context.yaml`; context only, no SQL enforcement.
-- SQL generation node: loads `sql_generation.yaml`; Qwen generates candidate `SELECT` SQL for the `run_sql` path only.
-- Explanation node: loads `explanation.yaml`; Qwen explains retrieved rows, with fallback wording if needed.
-- SQL safety node: Python rejects non-SELECT SQL, destructive SQL, and multiple statements before execution.
-- Known values: enum/category-like values live in YAML; live operational records stay in PostgreSQL.
-
-## Local Tests
-
-After installing dependencies:
+Run tests locally after installing dependencies:
 
 ```powershell
 python3 -m pip install -r requirements.txt
 python3 -m pytest Backend/tests -q
 ```
 
-Inside the API container after rebuilding:
+Run tests inside the API container:
 
 ```powershell
-docker exec -it scheduling_api pytest tests
+docker exec -it scheduling_api pytest tests -q
 ```
+
+Check seed data after containers are running:
+
+```powershell
+docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT COUNT(*) FROM work_orders;"
+```
+
+Inspect recent agent audit logs:
+
+```powershell
+docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT action_type, input_question, sql_generated, result_summary, confidence, created_at FROM agent_action_log ORDER BY created_at DESC LIMIT 5;"
+```
+
+## Architecture Notes
+
+- Deterministic routing handles known scheduling questions and business tools.
+- Qwen is used for SQL generation in the `run_sql` path and for plain-English explanations.
+- Python enforces SQL safety before execution with read-only `SELECT` validation.
+- `Backend/prompts/schema_context.yaml` gives Qwen the allowed schema and business context.
+- `/api/v1/ask` writes a best-effort audit row to `agent_action_log`.
+- If Ollama is unavailable during explanation, the API returns a deterministic fallback summary.
 
 ## Known Limitations
 
-- The UI is intentionally minimal: plain HTML and browser JavaScript only.
-- No multi-turn conversation memory.
-- Tool selection is keyword-based by design.
-- First Docker startup downloads Ollama and `qwen2.5:3b`, so it can take time.
+- First Docker startup can be slow while Ollama and `qwen2.5:3b` download.
+- Qwen 3B may produce imperfect explanations on consumer hardware.
+- Tool selection is router/keyword based by design.
+- The UI is intentionally minimal.
+- There is no multi-turn conversation memory.

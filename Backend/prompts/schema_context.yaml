@@ -68,17 +68,42 @@ schema:
     v_machine_load:
       purpose: "Machine load summary. Best view for overload and capacity questions."
       columns:
+        machine_id: "Machine identifier."
+        machine_name: "Human-readable machine name."
+        machine_type: "Machine category."
+        capacity_hours_day: "Normal daily machine capacity in hours."
+        available_hours_today: "Actual usable hours remaining today."
+        current_status: "Current availability state: available, partial, or unavailable."
         queued_hours: "Total pending/in-progress processing hours assigned to the machine."
         load_pct: "queued_hours divided by capacity_hours_day times 100."
 
     v_at_risk_orders:
       purpose: "Orders that cannot complete given current status, machine availability, or due date."
       columns:
+        wo_id: "Work order identifier."
+        product_code: "Product being produced."
+        quantity: "Number of units in the order."
+        required_machine: "Machine needed to process this order."
+        processing_time_hr: "Required processing time in machine hours."
+        priority: "Business urgency from 1 to 5. 1 is most critical, 5 is lowest."
+        due_date: "Date the work order should be completed."
+        status: "Order status."
+        available_hours_today: "Actual usable hours remaining today."
+        machine_status: "Machine availability state."
         risk_reason: "Human-readable reason the order is risky."
 
     v_priority_queue:
       purpose: "Orders due within the next 3 days, ranked by priority."
       columns:
+        wo_id: "Work order identifier."
+        product_code: "Product being produced."
+        product_name: "Human-readable product name."
+        quantity: "Number of units in the order."
+        required_machine: "Machine needed to process this order."
+        processing_time_hr: "Required processing time in machine hours."
+        priority: "Business urgency from 1 to 5. 1 is most critical, 5 is lowest."
+        due_date: "Date the work order should be completed."
+        status: "Order status."
         days_remaining: "due_date minus CURRENT_DATE."
 
 known_values:

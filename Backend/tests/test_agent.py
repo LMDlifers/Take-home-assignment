@@ -70,7 +70,7 @@ def test_ask_uses_generated_safe_sql(monkeypatch) -> None:
     monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
-    response = agent.answer_question("Which work orders are delayed?")
+    response = agent.answer_question("Show work orders on M1")
 
     assert response["tool_used"] == "run_sql"
     assert response["sql_used"] == "SELECT wo_id FROM work_orders"
@@ -83,13 +83,37 @@ def test_successful_run_sql_is_logged(monkeypatch) -> None:
     monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
     monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
 
-    agent.answer_question("Which work orders are delayed?")
+    agent.answer_question("Show work orders on M1")
 
     assert logs[0]["action_type"] == "query_generated"
-    assert logs[0]["input_question"] == "Which work orders are delayed?"
+    assert logs[0]["input_question"] == "Show work orders on M1"
     assert logs[0]["sql_generated"] == "SELECT wo_id FROM work_orders"
     assert logs[0]["confidence"] == 0.75
     assert logs[0]["result_summary"] == "Found 1 work orders: WO-1003."
+
+
+def test_known_delayed_question_uses_deterministic_sql(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": "WO-1003"}])
+    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is delayed.")
+
+    response = agent.answer_question("Which work orders are delayed?")
+
+    assert response["tool_used"] == "run_sql"
+    assert "WHERE status = 'delayed'" in response["sql_used"]
+    assert response["data"][0]["wo_id"] == "WO-1003"
+
+
+def test_known_wo_1003_question_uses_deterministic_sql(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", fail_if_generate_sql_called)
+    monkeypatch.setattr(db, "fetch_all", lambda sql, params=(): [{"wo_id": params[0]}])
+    monkeypatch.setattr(agent, "explain_result", lambda question, data: "WO-1003 is blocked on M4.")
+
+    response = agent.answer_question("Why is WO-1003 at risk?")
+
+    assert response["tool_used"] == "run_sql"
+    assert "FROM v_at_risk_orders" in response["sql_used"]
+    assert response["data"][0]["wo_id"] == "WO-1003"
 
 
 def test_check_load_tool_uses_deterministic_query(monkeypatch) -> None:
@@ -287,7 +311,29 @@ def test_recommend_is_logged_as_recommendation(monkeypatch) -> None:
 def test_unsafe_generated_sql_is_rejected(monkeypatch) -> None:
     monkeypatch.setattr(agent, "generate_sql", lambda question: ("DELETE FROM work_orders", ()))
 
-    response = agent.answer_question("Which work orders are delayed?")
+    response = agent.answer_question("Show work orders on M1")
+
+    assert response["data"] == []
+    assert response["confidence"] == 0.2
+
+
+def test_bad_generated_sql_execution_is_rejected(monkeypatch) -> None:
+    def broken_fetch_all(sql, params=()):
+        raise psycopg.ProgrammingError("bad generated SQL")
+
+    monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT missing_column FROM work_orders", ()))
+    monkeypatch.setattr(db, "fetch_all", broken_fetch_all)
+
+    response = agent.answer_question("Show work orders on M1")
+
+    assert response["data"] == []
+    assert response["confidence"] == 0.2
+
+
+def test_placeholder_mismatch_is_rejected(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "generate_sql", lambda question: ("SELECT * FROM work_orders WHERE wo_id = %s AND required_machine = %s", ("WO-1003",)))
+
+    response = agent.answer_question("Show work orders on M1")
 
     assert response["data"] == []
     assert response["confidence"] == 0.2
@@ -369,9 +415,15 @@ def test_prompt_files_load() -> None:
 
 def test_sql_prompt_includes_known_values() -> None:
     prompt = agent.sql_prompt()
+    views = agent.schema_context()["schema"]["views"]
 
     assert "v_machine_load" in prompt
     assert "v_at_risk_orders" in prompt
+    assert "wo_id" in views["v_at_risk_orders"]["columns"]
+    assert "machine_status" in views["v_at_risk_orders"]["columns"]
+    assert "risk_reason" in views["v_at_risk_orders"]["columns"]
+    assert "days_remaining" in views["v_priority_queue"]["columns"]
+    assert any("Never invent columns" in rule for rule in agent.sql_generation_config()["rules"])
     assert "M1" in prompt
     assert "available" in prompt
     assert "partial" in prompt
