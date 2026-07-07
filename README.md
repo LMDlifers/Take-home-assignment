@@ -193,6 +193,7 @@ docker exec -it scheduling_db psql -U postgres -d scheduling_db -c "SELECT actio
 
 ## Architecture Notes
 
+- See [DESIGN.md](DESIGN.md) for concise design rationale and tradeoffs.
 - Deterministic routing handles known scheduling questions and business tools.
 - Qwen is used for SQL generation in the `run_sql` path and for plain-English explanations.
 - Python enforces SQL safety before execution with read-only `SELECT` validation.
